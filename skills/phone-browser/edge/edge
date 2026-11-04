@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""CLI for the Edge bridge:  edge js '<expr>' | edge text | edge click '<css>' | edge status"""
+import json, subprocess, sys, time, urllib.request
+
+BRIDGE = "http://127.0.0.1:8765"
+PKG = "com.microsoft.emmx"
+
+
+def run_mcp(tool, args):
+    import sys as _s
+    _s.path.insert(0, __file__.rsplit("/", 1)[0] if "/" in __file__ else ".")
+    import mcp_edge
+    return mcp_edge.run_tool(tool, args)
+
+
+def open_in_edge(url):
+    scheme, rest = ("https", url)
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+    intent = "intent://%s#Intent;scheme=%s;package=%s;end" % (rest, scheme, PKG)
+    subprocess.run(["android-open", intent], capture_output=True, text=True)
+    for _ in range(40):
+        time.sleep(0.25)
+        try:
+            with urllib.request.urlopen(BRIDGE + "/status", timeout=2) as f:
+                d = json.loads(f.read())
+            if d.get("tabs"):
+                return {"ok": True, "tabs": len(d["tabs"])}
+        except Exception:
+            pass
+    return {"ok": False, "error": "Edge did not connect (is the userscript enabled?)"}
+
+
+
+def post(payload, timeout=30):
+    req = urllib.request.Request(BRIDGE + "/cmd", data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def main(a):
+    if not a:
+        print(__doc__); return
+    cmd, rest = a[0], a[1:]
+    arg = " ".join(rest)
+    if cmd == "snap":
+        print(run_mcp("edge_snapshot", {}).get("value", "")); return
+    if cmd == "open":
+        print(json.dumps(open_in_edge(arg), ensure_ascii=False)); return
+    if cmd == "js":
+        r = post({"type": "eval", "code": arg})
+    elif cmd == "text":
+        sel = json.dumps(rest[0]) if rest else '"body"'
+        r = post({"type": "eval", "code": "document.querySelector(%s).innerText" % sel})
+    elif cmd == "click":
+        r = post({"type": "click", "selector": arg})
+    elif cmd == "fill":
+        r = post({"type": "fill", "selector": rest[0], "code": " ".join(rest[1:])})
+    elif cmd == "status":
+        with urllib.request.urlopen(BRIDGE + "/status", timeout=5) as f:
+            r = json.loads(f.read())
+    else:
+        print(__doc__); return
+    print(r.get("value") if r.get("ok") else json.dumps(r, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

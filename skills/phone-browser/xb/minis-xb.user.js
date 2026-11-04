@@ -1,0 +1,149 @@
+// ==UserScript==
+// @name         Minis Bridge XB
+// @namespace    minis.local
+// @version      3.2
+// @description  让 Minis 直接操控这个浏览器页面（DOM/JS），保留登录态
+// @match        *://*/*
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// @run-at       document-idle
+// @noframes
+// @match        *
+// @include      *
+// @updateURL    http://127.0.0.1:8765/xb.user.js
+// @downloadURL  http://127.0.0.1:8765/xb.user.js
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  var BASE = 'http://127.0.0.1:8765';
+  var tab = Math.random().toString(36).slice(2, 9);
+  var lastOk = Date.now();
+  var waiting = null;          // 当前挂起的 poll 对象
+  var stopped = false;
+
+  function req(path, body, timeout, onReq) {
+    return new Promise(function (resolve, reject) {
+      var r = GM_xmlhttpRequest({
+        method: 'POST',
+        url: BASE + path,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify(body || {}),
+        timeout: timeout,
+        onload: function (res) {
+          if (onReq) onReq(null);
+          try { resolve(JSON.parse(res.responseText)); }
+          catch (e) { resolve({ ok: false, error: 'bad json' }); }
+        },
+        onerror: function () { if (onReq) onReq(null); reject(new Error('bridge unreachable')); },
+        ontimeout: function () { if (onReq) onReq(null); reject(new Error('bridge timeout')); },
+        onabort: function () { reject(new Error('aborted')); }
+      });
+      if (onReq) onReq(r);
+    });
+  }
+
+  function target(selector) {
+    if (typeof selector !== 'string' || !selector) throw Error('missing selector');
+    if (selector.indexOf('minis-ref:') === 0) {
+      var book=document[Symbol.for('minis.snapshot.v1')], item=book && book.nodes.get(selector);
+      if (!item || book.url!==location.href || !item.node.isConnected ||
+          item.node.ownerDocument!==document || book.signature(item.node)!==item.sig)
+        throw Error('stale_ref: take a new snapshot');
+      return item.node;
+    }
+    var found=document.querySelectorAll(selector);
+    if (found.length!==1) throw Error(found.length ? 'ambiguous selector: '+found.length : 'no element: '+selector);
+    return found[0];
+  }
+  function beforeClick(el) {
+    return {url:location.href,tag:el.localName,label:(el.getAttribute('aria-label') ||
+      el.innerText || el.getAttribute('title') || '').trim().slice(0,60),
+      expected_url:el.localName==='a' ? el.href : null};
+  }
+  function run(job) {
+    if(document.visibilityState!=='visible') throw Error('tab_hidden: action not run');
+    if (job.type === 'click') {
+      var el=target(job.selector), before=beforeClick(el);
+      if(el.matches(':disabled,[aria-disabled="true"]')) throw Error('disabled element');
+      el.scrollIntoView({ block: 'center' });
+      el.click();
+      return {state:'click_dispatched',before:before,after:{url:location.href,title:document.title}};
+    }
+    if (job.type === 'fill') {
+      var f=target(job.selector);
+      if (f.matches(':disabled,[aria-disabled="true"]') || f.readOnly) throw Error('field is not writable');
+      if (!f.matches('input,select,textarea')) throw Error('not a form field');
+      f.focus();
+      f.value = job.code || '';
+      f.dispatchEvent(new Event('input', { bubbles: true }));
+      f.dispatchEvent(new Event('change', { bubbles: true }));
+      return 'filled';
+    }
+    var v = new Function('return (' + (job.code || 'null') + ')')();
+    return v;
+  }
+
+  async function loop() {
+    var backoff = 300;
+    for (;;) {
+      if (stopped) { await new Promise(function (r) { setTimeout(r, 1000); }); continue; }
+      var job;
+      try {
+        job = await req('/poll', {
+          tab: tab,
+          url: location.href,
+          title: document.title,
+          visible: document.visibilityState === 'visible',
+          focus: document.hasFocus(),
+          v: 13
+        }, 26000, function (r) { if (r) waiting = r; else waiting = null; });
+        lastOk = Date.now();
+        backoff = 300;
+      } catch (e) {
+        await new Promise(function (r) { setTimeout(r, 1500); });
+        backoff = Math.min(backoff * 2, 8000);
+        continue;
+      }
+      // 空结果说明长轮询自然到期，立刻重连；只有出错才退避
+      if (!job || !job.id) { continue; }
+      // 先回执：让服务端知道「已经开始执行」，即使结果丢失也不会被当成没执行
+      var receipt={id:job.id, tab:tab, url:location.href, title:document.title};
+      if (job.type==='click') { try { receipt.before=beforeClick(target(job.selector)); } catch(_){} }
+      // eval 幂等且不会跳转，回执没意义，省一次往返；click/fill 保留（可能触发卸载）
+      if (job.type !== 'eval') { try { await req('/ack', receipt, 8000); } catch (e) {} }
+      var out;
+      try {
+        var v = run(job);
+        if (v && typeof v.then === 'function') v = await v;
+        var val = (v !== null && typeof v === 'object') ? JSON.stringify(v) : String(v);
+        out = { id: job.id, ok: true, value: val, url: location.href, title: document.title, v: 13 };
+      } catch (e) {
+        out = { id: job.id, ok: false, error: String((e && e.stack) || e), v: 13 };
+      }
+      out.tab=tab;
+      try { await req('/result', out, 10000); } catch (e) {}
+    }
+  }
+
+  // Do not abort a poll on focus: an in-transit response may already contain a job.
+  function presence(hidden) {
+    req('/presence',{tab:tab,url:location.href,title:document.title,
+      visible:!hidden && document.visibilityState==='visible',focus:document.hasFocus()},2500).catch(function(){});
+  }
+  document.addEventListener('visibilitychange',function(){ presence(false); },true);
+  window.addEventListener('focus',function(){ presence(false); },true);
+  window.addEventListener('blur',function(){ presence(false); },true);
+  window.addEventListener('pageshow',function(){ presence(false); },true);
+  window.addEventListener('pagehide',function(){ presence(true); },true);
+
+  // 看门狗：超过 40s 没有成功轮询，就掐掉挂起的请求重来
+  setInterval(function () {
+    if (Date.now() - lastOk > 40000) {
+      lastOk = Date.now();
+      try { if (waiting && waiting.abort) waiting.abort(); } catch (e) {}
+    }
+  }, 10000);
+
+  loop();
+})();
