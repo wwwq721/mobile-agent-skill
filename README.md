@@ -14,19 +14,28 @@
 
 ## 实测环境
 
-- Honor Honor 手机 / Android 10（SDK 29）/ 1080×2400
+- Honor 手机 / Android 10（SDK 29）/ 1080×2400
 - 运行宿主：Minis（提供 `android-a11y-cli`、`android-clipboard`、`minis-scheduled` 等命令行工具）
 - 浏览器：Edge 移动版 + 篡改猴（Tampermonkey）
 - 坐标参数都是这台机器量出来的，换机型要重新 `ui dump` 校准
 
-## 怎么跑起来
+## 装起来
 
-1. 手机开启无障碍服务（本机是「设置 → 无障碍 → Minis」），`android-a11y-cli service ping` 能通；
-2. 浏览器装篡改猴，打开 `http://127.0.0.1:8765/minis.user.js` 安装脚本；
-3. 桥服务在 MCP 启动时自动拉起，`edge status` 能看到在线标签页；
-4. 直接让 AI 干活，例如：
-   - "打开 QQ 邮箱，给 xxx 写一封信，收件人/主题/正文按我说的填，写完先别发"
-   - "在 Edge 里查一下某平台的公告，把所有带日期的条目列出来"
+```bash
+sh install.sh      # 查依赖 → 装 CLI → 起桥 → 注册 MCP → 自检
+```
+
+手动步骤、验收命令、排错表在 [INSTALL.md](INSTALL.md)。装完还要人工做两件事：
+**开无障碍服务**、**在手机浏览器里装油猴脚本**（`http://127.0.0.1:8765/minis.user.js`，装前已开的标签要刷新）。
+
+> 浏览器这一半靠的就是那个油猴脚本（`skills/phone-browser/edge/minis.user.js`，X 浏览器版在 `skills/phone-browser/xb/`）——
+> 没有它，`edge_*` 工具全部超时。
+
+## 跑起来之后
+
+- "打开 QQ 邮箱，给 xxx 写一封信，收件人/主题/正文按我说的填，写完先别发"
+- "在浏览器里查一下某平台的公告，把所有带日期的条目列出来"
+- "把当前屏幕上的按钮读一遍，告诉我哪个能提交"
 
 ## 三个最值得抄的经验
 
