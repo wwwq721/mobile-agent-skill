@@ -20,7 +20,7 @@ xb status        # ok  sv=3.9.1  tabs=1  pending=0  cache=0B
                  #   nosf6n1  就绪  https://…
 ```
 
-- 没响应 → 桥没起：`sh /var/minis/skills/phone-browser/bridge/restart.sh`
+- 没响应 → 桥没起：`sh skills/phone-browser/bridge/restart.sh`
 - `没有标签` → 浏览器没开或已退到后台被杀（`android-open <url>` 拉起）
 - 标签显示 `脚本旧(3.9.0)` → 那个标签跑旧脚本，刷新页面
 - `后台` / `raf=0` → 页面被冻结，操作会用不了；把浏览器切到前台

@@ -8,7 +8,7 @@
 # 等待预算规则：桥的任务时限 = 用户给的值（不变）；curl 的网络等待 = 任务时限 + MARGIN。
 # 两者相等时，桥刚结束等待、结果还没写完，curl 就先断开（退出 28、无正文）。
 B=http://127.0.0.1:8765
-D=/var/minis/skills/phone-browser
+D=$(cd "$(dirname "$0")/.." && pwd)
 MARGIN=2
 op_id=
 

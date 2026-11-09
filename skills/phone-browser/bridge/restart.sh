@@ -1,7 +1,7 @@
 #!/bin/sh
 # 重启桥：只认「解释器 + 本目录 bridge.py 的真实路径」，不误杀同名脚本或普通 shell。
 # 退出码：0 成功；1 旧实例没停掉；2 新实例没起来。
-TARGET="$(readlink -f /var/minis/skills/phone-browser/bridge/bridge.py)"
+TARGET="$(readlink -f "$(dirname "$0")/bridge.py")"
 URL="http://127.0.0.1:8765/status"
 SELF=$$
 
