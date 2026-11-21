@@ -1,63 +1,57 @@
 # 手机端 AI 操控技能包
 
-在 Android 手机上让 AI 直接操作手机：读屏、点按钮、填表单、操作浏览器并保留登录态。
-不是演示 Demo，是能替自己干杂事的工具链。
+让 AI 直接操作一台 Android 手机：读屏、点按钮、填表、开 App，以及在用户自己的浏览器里上网。
+两个技能各自一个可执行脚本，Python 3 标准库，无第三方依赖。
 
-## 它由两个技能组成
-
-| 技能 | 解决什么 | 关键手段 |
+| 技能 | 解决什么 | 入口 |
 |---|---|---|
-| `mobile-ops` | 操作任意 App 的原生界面 | Android 无障碍服务（AccessibilityService）：`ui dump` 拿节点树 → 按文本/坐标点击 → 输入 |
-| `phone-browser` | 在浏览器里读写网页、保留登录态 | 油猴脚本 + 本地长轮询桥：沙箱里发命令，页面内执行 JS，把 DOM 结果送回 |
+| `screen` | 操控任意 App 的原生界面：看一次、动一次、验一次 | `scr` |
+| `x-browser` | 接管用户手机上的 X 浏览器（登录态/书签/历史都是他的） | `bw` |
 
-两者互补：原生界面拿不到 DOM 就用 `mobile-ops`，网页要精确取数就用 `phone-browser`。
+```bash
+scr look                      # 这一屏有什么
+scr tap 设置                  # 找到→点中→等稳定→贴回新一屏
+scr open 哔哩哔哩            # 启动 App（图标 → 文件夹 → 最近任务 → 全页扫）
+scr do "open:设置" "tap:WLAN" # 一串动作一次做完
 
-## 实测环境
+bw go https://example.com     # 开页并贴回正文（走真浏览器，带登录态）
+bw read                       # 读当前屏
+bw tap 登录                   # 点链接/按钮
+bw close                      # 收尾：只关自己开的标签
+```
 
-- Honor 手机 / Android 10（SDK 29）/ 1080×2400
-- 运行宿主：Minis（提供 `android-a11y-cli`、`android-clipboard`、`minis-scheduled` 等命令行工具）
-- 浏览器：X 浏览器（`com.mmbox.xbrowser`）+ 用户脚本
-- 坐标参数都是这台机器量出来的，换机型要重新 `ui dump` 校准
+## 设计取舍（值得抄的三条）
+
+1. **看一次、动一次、验一次。** 每次动作都自带结果判定：`✔ … · 变` / `… · 无变化`。变了就往下走，不再复读屏幕——省的是模型的往返，不是脚本的 CPU。
+2. **能用文字就别用坐标。** 坐标只在节点读不到的界面用；`sN`（上一次 look 的第 N 项）屏一变就作废，过期直接拒绝，不瞎点。
+3. **登录态不可替换。** 浏览器不换容器、不代填密码；`bw fast` 走内置 WebView 只读公开页（毫秒级、不留标签），要真点真填才用 `bw go`。
 
 ## 装起来
 
-```bash
-sh install.sh      # 查依赖 → 装 xb/mshot/mloc → 起桥 → 自检
-```
-
-手动步骤、验收命令、排错表在 [INSTALL.md](INSTALL.md)。装完还要人工做两件事：
-**在手机浏览器里装用户脚本**（`http://127.0.0.1:8765/xb.user.js`，装前已开的标签要刷新）、
-**开无障碍服务**（只有原生操控那一半需要）。
-
-> 浏览器这一半靠的就是那个用户脚本（`skills/phone-browser/xb/minis-xb.user.js`，桥自动对外提供 `/xb.user.js`）——
-> 没有它，`xb` 只会返回"没有标签"。
-
-## 跑起来之后
+前置：一台 Android 手机 + 能执行 shell 的宿主（本包按 Minis 提供的 `android-a11y-cli` 等命令编写）、python3 ≥ 3.7、X 浏览器（`com.mmbox.xbrowser`）。
 
 ```bash
-xb open 'https://example.com/'   # 复用现有标签
-xb snapshot                      # 可点元素的紧凑列表
-xb click 'ref 或 CSS'
-xb text                          # 正文前 3000 字
+sh install.sh      # 软链 scr / bw 到 /usr/local/bin，并做一次体检
 ```
 
-- "打开 QQ 邮箱，给 xxx 写一封信，收件人/主题/正文按我说的填，写完先别发"
-- "在浏览器里查一下某平台的公告，把所有带日期的条目列出来"
-- "把当前屏幕上的按钮读一遍，告诉我哪个能提交"
+手动步骤、验收命令、排错表见 [INSTALL.md](INSTALL.md)。
 
-## 三个最值得抄的经验
+## 范围与边界
 
-1. **一次 dump 拿全量结构，然后一条命令连续执行。** 点击 50 ms，模型往返 2–8 s，慢的从来不是点，是"看一眼再点"。
-2. **浏览器只有最可见的那个标签能执行 JS。** 后台标签会被冻结，命令必然超时；要连续操作就把"打开→做→取"压进同一条命令。
-3. **富文本框不吃外部写入。** 原生界面走"写剪贴板 → 长按 → 粘贴"；网页里的 Lexical/Slate 直接如实失败，别重试。
+- **只有四件事**：打开、读取、点击、填普通表单。富文本编辑器（Lexical/Slate/ProseMirror 一类）不在范围内，工具会如实回失败，不假装成功。
+- 无障碍通道**表达不了**"按住不动再拖"：手势时长按路径几何长度分配，"静止"长度是 0。桌面整理类操作因此受限，具体见 `skills/screen/scenarios/desktop.md`。
+- 浏览器只有**最可见的那个标签**能执行 JS；后台标签会被系统冻结。
+- 人和 AI 不要同时操作同一块屏幕：人在用时应当停手。
 
-## 已知边界
+## 目录
 
-- 仅 Android ≤ 10 需要截图绕路（`mshot` 走通知栏截屏磁贴）；Android 11+ 直接用 `ui screenshot`。
-- 无障碍服务被系统强停后需要重新授权。
-- 同一块屏幕不要同时让人和 AI 操作：人在用时应当停手。
+```
+skills/screen/        SKILL.md · scr · 迁移.md · references/{实测记录,设备参数}.md · scenarios/desktop.md
+skills/x-browser/     SKILL.md · bw · reference.md · 迁移.md
+```
+
+`迁移.md` 是给"接手这个技能的人"的：第一次部署要注意什么、换机顺序、改哪块代码必须连带改什么。
 
 ## 许可
 
-木兰宽松许可证第 2 版（Mulan PSL-2.0），与 EduWork 的贡献许可一致。
-脚本与文档均为原创；`bridge.py` / `minis-xb.user.js` 不含第三方代码。
+木兰宽松许可证第 2 版（Mulan PSL-2.0）。原创脚本与文档，不含第三方代码。

@@ -1,0 +1,1824 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""scr — 看一次，动一次，验一次。
+
+根本目的：让 AI 用最少的回合把这台手机上的事做完，而且不点错。
+用法要点（细节见同目录 SKILL.md）：
+    scr look            看现在这一屏（节点有内容就给节点，没内容自动给截图）
+    scr tap 文字        找到它、点它、等页面稳定、把新一屏回给你
+    scr xy 540 1200     点设备像素（图上红字刻度就是设备像素，直接抄）
+    scr type 文本       往焦点输入框写字
+    scr key back        返回/主页/通知栏
+    scr open 微信       启动应用
+    scr do "tap:微信" "wait:发送" ...
+所有动作用完都自带"变没变"的结论，绝大多数步骤不需要再单独看一次。
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+WORK = "/var/minis/workspace/shots"     # 过程件，按需保留最近几张
+KEEP = 2
+SYS = "com.android.systemui"
+TILE_WORDS = ("截屏", "屏幕截图", "Screenshot")
+EDITOR_HINTS = ("multiscreenshot", "screenshot", "hwscreenshot")
+
+# ---------- 设备档案（换机改这里 + 删 device.json） ----------
+DEVFILE = "/var/minis/skills/screen/device.json"
+# 本机：安卓 17 机型（4 列 6 行 + Dock），换机用 scr doctor --save 重测
+DEV_DEFAULT = {"w": 1280, "h": 2772, "scale": 0.5, "cols": 4, "rows": 6,
+               "launcher": "com.miui.home",
+               # 实测（look 报出的节点中心，列距 301、行距 326）：旧值 227/502/777/1052、
+               # 560/858…是等分算出来的假坐标，按它点会偏到邻格。
+               "grid_x": [188, 489, 790, 1091],
+               "grid_y": [407, 733, 1059, 1385, 1711, 2037]}
+# 屏幕顶部这个比例以内的"下滑"会被系统当成下拉通知/搜索——拖拽起点必须避开，
+# 否则手势被 systemui 吃掉，看起来像"没反应"（踩过两次）。
+TOP_DEAD = 0.15
+
+
+def dev():
+    d = dict(DEV_DEFAULT)
+    try:
+        d.update({k: v for k, v in (json.load(open(DEVFILE)) or {}).items() if v})
+    except Exception:                                          # noqa: BLE001
+        pass
+    return d
+
+
+def save_dev(d):
+    try:
+        json.dump(d, open(DEVFILE, "w"), ensure_ascii=False, indent=1)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def screen_size():
+    """屏幕像素。(w, h)
+
+    从 ui dump 里面积最大的那个整屏节点反推（它的 center 就是屏幕中心），
+    读不到才退回档案值。为什么不问截图元数据：那要多花 1.5–3s，而 dump 反正要做。
+    """
+    d = dev()
+    try:
+        nodes = _LAST["nodes"] or raw_nodes()
+        best = max(nodes, key=lambda n: area(n["bounds"]))
+        w, h = best["center"]["x"] * 2, best["center"]["y"] * 2
+        if w > 400 and h > 800:
+            # 只信"接近档案值"的测量：前台是悬浮窗/分屏/键盘弹出时，最大节点只是那个窗口，
+            # 直接落盘会把 1280×2114 这种尺寸永久写进 device.json，之后整屏过滤全错。
+            dw, dh = d["w"], d["h"]
+            if abs(w - dw) / dw <= 0.03 and abs(h - dh) / dh <= 0.03:
+                if (w, h) != (dw, dh):
+                    d.update({"w": w, "h": h})
+                    save_dev(d)
+            return w, h
+    except Exception:                                          # noqa: BLE001
+        pass
+    return d["w"], d["h"]
+
+
+# ---------- 与设备对话 ----------
+def a11y(*args, t=15):
+    try:
+        p = subprocess.run(["android-a11y-cli", *args], capture_output=True, text=True, timeout=t)
+        out = p.stdout.strip()
+        if out.startswith("{"):
+            d = json.loads(out)
+            e = d.get("error")
+            if isinstance(e, str):        # 参数错时 CLI 返回 {"error":"invalid_args","message":...}
+                d["error"] = {"code": e.upper(), "message": d.get("message", "")}
+            return d
+        return {"ok": False, "error": {"code": "NO_JSON", "message": (out + p.stderr)[:200]}}
+    except Exception as e:                                    # noqa: BLE001
+        return {"ok": False, "error": {"code": "EXC", "message": str(e)[:160]}}
+
+
+def die(d):
+    e = d.get("error") or {}
+    code = e.get("code", "ERROR")
+    msg = e.get("message", "")
+    hint = {
+        "SERVICE_NOT_RUNNING": "无障碍没开：让用户去 设置→无障碍 打开 Minis（用户自己操作手机时会关掉它）",
+        "PERMISSION_DENIED": "Minis 的 Agent 授权没给，去 设置→权限",
+    }.get(code, "")
+    print(f"✘ {code} {msg}" + (f"\n  {hint}" if hint else ""))
+    sys.exit(2)
+
+
+def info():
+    for _ in range(3):
+        d = a11y("ui", "info")
+        data = (d.get("data") or {}) if d.get("ok") else {}
+        if data.get("packageName"):
+            return data
+        time.sleep(0.1)
+    return data
+
+
+_LAST = {"nodes": []}
+
+
+_SCRN = {}
+
+
+def _scrn():
+    """屏幕尺寸缓存：过滤越界节点要用，不该每次都去问系统。"""
+    if not _SCRN:
+        # 不能走 screen_size()：它读不到节点时会回头调 raw_nodes()，递归。
+        d = dev()
+        _SCRN["w"], _SCRN["h"] = d["w"], d["h"]
+    return _SCRN["w"], _SCRN["h"]
+
+
+def _drop_offscreen(nodes):
+    """过渡帧（页面还在滑入）会把整棵树平移一整屏：Settings 页曾报
+    返回@1400、扫描二维码@2452，正好 +1280。这种坐标点下去必然打偏，
+    宁可当作"这一屏没东西"重新取，也不能把它当真实位置交出去。"""
+    W, H = _scrn()
+    keep = []
+    for n in nodes:
+        c = n.get("center") or {}
+        x, y = c.get("x"), c.get("y")
+        if x is None or y is None:
+            keep.append(n)
+        elif 0 <= x < W and 0 <= y < H:
+            keep.append(n)
+    return keep
+
+
+def raw_nodes(retry=4):
+    """取节点树。空树/整树越界（页面切换动画中）就重取，最多 retry 次。
+    MIUI 桌面刚回 home、刚翻页时会有 0.3–1s 只返回状态栏的空窗期，
+    老版本把这个空窗当成"这一屏没有东西"，于是 open 打出「0 项」。"""
+    nodes = []
+    for i in range(retry):
+        d = a11y("ui", "dump")
+        if not d.get("ok"):
+            die(d)
+        nodes = _drop_offscreen(d["data"]["nodes"] or [])
+        if i == retry - 1:
+            break
+        # 只剩状态栏（<4 个节点）或整树被丢掉：说明页面还没落定
+        if len(nodes) < 4:
+            time.sleep(0.12)
+            continue
+        break
+    _LAST["nodes"] = nodes
+    return nodes
+
+
+# ---------- 把节点树压成"一屏能读完"的清单 ----------
+NOISE = {"按钮", "标签", "图片", "开关", "复选框", "单选按钮", "选项卡", "图标"}
+
+
+def clean_desc(d):
+    """contentDesc 里塞满了 "按钮/标签/7之3" 这类读屏口水，先榨干再当标签。"""
+    out = []
+    for p in re.split(r"[，,、]", d):
+        p = p.strip()
+        if not p or p in NOISE or re.fullmatch(r"\d+之\d+|第\d+项|\d+条未读", p):
+            continue
+        p = re.sub(r"^(按钮|标签|图标)\s*[·.]?\s*", "", p)
+        out.append(p)
+    return " / ".join(out)
+
+
+def lbl(n):
+    t = (n.get("text") or "").strip()
+    if not t:
+        t = clean_desc((n.get("contentDesc") or "").strip())
+    return re.sub(r"\s+", " ", t)[:60]
+
+
+def area(b):
+    return max(0, b["right"] - b["left"]) * max(0, b["bottom"] - b["top"])
+
+
+def inside(o, i):
+    return (o["left"] <= i["left"] and o["top"] <= i["top"]
+            and o["right"] >= i["right"] and o["bottom"] >= i["bottom"])
+
+
+def build(nodes):
+    """把节点树压成"一行一个能点的东西"：按钮自己的文字当标题，副标题并进去。"""
+    H = max([n["bounds"]["bottom"] for n in nodes] + [2400])
+    W = max([n["bounds"]["right"] for n in nodes] + [1080])
+    vis = [n for n in nodes
+           if n["bounds"]["top"] > H * 0.045        # 状态栏：时间/网速每秒在变，会把"变了没"污染成永远"变了"
+           and n["bounds"]["bottom"] < H * 0.985    # 底部手势条
+           and area(n["bounds"]) > 0]
+    full = 0.55 * W * H
+    texts = [n for n in vis if lbl(n)]
+    tgts = [n for n in vis
+            if (n["clickable"] or n["editable"] or n["checkable"])
+            and (lbl(n) or area(n["bounds"]) >= 4000)
+            and area(n["bounds"]) < full]
+
+    rows, taken, shells = [], set(), []
+    for t in sorted(tgts, key=lambda n: (n["center"]["y"], n["center"]["x"])):
+        if id(t) in taken:
+            continue
+        if any(inside(s, t["bounds"]) and not lbl(t) for s in shells):
+            continue                      # 没有自己文字的大容器套小容器：只报外层
+        parts, last = [], None
+        for x in sorted([x for x in texts if inside(t["bounds"], x["bounds"])],
+                        key=lambda n: (n["bounds"]["top"], n["bounds"]["left"])):
+            if id(x) in taken or lbl(x) == last:
+                continue
+            parts.append(lbl(x))
+            taken.add(id(x))
+            last = lbl(x)
+        rows.append([" · ".join(parts[:2])[:46], t])
+        taken.add(id(t))
+        shells.append(t["bounds"])
+
+    # 没被任何按钮收走的文字（正文、说明、列表条目）：留前 8 条当上下文
+    used = [r[1]["bounds"] for r in rows]
+    spare = [x for x in texts if id(x) not in taken
+             and not any(inside(b, x["bounds"]) for b in used)]
+    for x in spare[:8]:
+        rows.append([lbl(x)[:46], x])
+
+    # 没文字的可点控件（开关、箭头、图标）：在自己上下找原来的标题贴上去
+    clickables = [n for n in vis if n["clickable"] or n["editable"] or n["checkable"]]
+    for r in rows:
+        n = r[1]
+        if n["clickable"] or n["editable"] or n["checkable"]:
+            continue
+        b, h = n["bounds"], n["bounds"]["bottom"] - n["bounds"]["top"]
+        near = [t for t in clickables if not lbl(t)
+                and abs(t["center"]["y"] - n["center"]["y"]) < max(h * 2, 220)
+                and (t["center"]["x"] < b["left"] or t["center"]["x"] > b["right"])]
+        if near:
+            r[1] = min(near, key=lambda t: abs(t["center"]["y"] - n["center"]["y"]))
+
+    short = [x for x in texts if len(lbl(x)) <= 18]
+    for r in rows:
+        n = r[1]
+        if lbl(n) or not (n["clickable"] or n["checkable"] or n["editable"]):
+            continue
+        pool = [x for x in (short or texts)
+                if abs(x["center"]["y"] - n["center"]["y"]) < 200
+                and x["center"]["x"] <= n["center"]["x"]]
+        if pool:
+            r[0] = lbl(min(pool, key=lambda x: abs(x["center"]["y"] - n["center"]["y"])))[:46]
+
+    # 同一横条上重复的标签（读屏把同一个 tab 报了两遍）：留最左边那个
+    seen = {}
+    for r in rows:
+        k = (r[0], r[1]["center"]["y"] // 40)
+        if r[0] and k in seen:
+            continue
+        if r[0]:
+            seen[k] = r
+    rows = [r for r in rows if not r[0] or seen.get((r[0], r[1]["center"]["y"] // 40)) is r]
+
+    # 同一控件被多行认领：留最上面那条（标题在上、说明在下）
+    by_node = {}
+    for r in rows:
+        k = r[1]["nodeId"]
+        if k not in by_node or r[1]["center"]["y"] <= by_node[k][1]["center"]["y"]:
+            by_node[k] = r
+    return sorted(by_node.values(), key=lambda x: (x[1]["center"]["y"] // 26, x[1]["center"]["x"]))
+
+
+def sig(items):
+    s = "|".join(f"{l}:{n['center']['x']}:{n['center']['y']}:{int(n['clickable'])}:"
+                 f"{int(n['checkable'] and n['checked'])}" for l, n in items)
+    return hashlib.md5(s.encode()).hexdigest()[:8]
+
+
+def render(items):
+    rows = []
+    for i, (label, n) in enumerate(items, 1):
+        f = "E" if n["editable"] else ("C" if n["clickable"] else "·")
+        if n["checkable"]:
+            f += "✔" if n["checked"] else "☐"
+        if n["scrollable"]:
+            f += "↕"
+        c = n["center"]
+        if not label and n["clickable"]:       # 桌面上文件夹节点没有文字，别显示成空白
+            label = "(文件夹)"
+        rows.append(f"s{i} {f:<3}{label[:44]} @{c['x']},{c['y']}")
+    return "\n".join(rows)
+
+
+def page_title(nodes):
+    cand = [n for n in nodes
+            if (n.get("text") or "").strip() and 110 < n["center"]["y"] < 330
+            and len(lbl(n)) <= 24 and n["packageName"] != SYS
+            and n["bounds"]["right"] - n["bounds"]["left"] > 180]
+    return lbl(cand[0]) if cand else ""
+
+
+def emit(items, pkg, nodes=None):
+    """默认把这一屏完整打印出来；链式执行时中间步骤只留一行结论。"""
+    if os.environ.get("SCR_QUIET"):
+        return
+    print(head_for(pkg, items, nodes))
+    print(render(items))
+
+
+LASTLOOK = os.path.join(WORK, "lastlook.json")
+
+
+def remember_look(s):
+    try:
+        os.makedirs(WORK, exist_ok=True)
+        json.dump({"sig": s, "ts": int(time.time())}, open(LASTLOOK, "w"))
+    except OSError:
+        pass
+
+
+def look_stale(s_now, max_age=180):
+    """`sN` 是"上一次 look 的第 N 项"，换了屏就作废——不比对就像拿旧门牌号开新门。"""
+    try:
+        st = json.load(open(LASTLOOK))
+    except Exception:                                          # noqa: BLE001
+        return "没有可用的 look 记录（先 scr look 一次）"
+    if st.get("sig") != s_now:
+        return "这一屏已经变了，sN 序号作废"
+    if time.time() - st.get("ts", 0) > max_age:
+        return f"上次 look 已超过 {max_age}s"
+    return None
+
+
+def snap():
+    nodes = raw_nodes()
+    items = build(nodes)
+    return items, sig(items), (info().get("packageName") or "?"), nodes
+
+
+def header(pkg, items, extra=""):
+    h = f"app {pkg} · {len(items)} 项" + (f" · {extra}" if extra else "")
+    return h
+
+
+def head_for(pkg, items, nodes=None):
+    t = page_title(nodes if nodes is not None else _LAST["nodes"])
+    return f"app {pkg}｜{t}｜{len(items)} 项" if t else f"app {pkg}｜{len(items)} 项"
+
+
+# ---------- 像素 ----------
+def photos(limit=1):
+    """查相册。失败返回 None——空列表代表"真的没有"，两者必须分开，
+    否则"查不到相册"会被说成"没有新截图"，把排查方向带偏。"""
+    try:
+        p = subprocess.run(["android-photos", "list", "--limit", str(limit)],
+                           capture_output=True, text=True, timeout=20)
+        media = json.loads(p.stdout)["media"]
+        return media if isinstance(media, list) else None
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def find_tile(nodes):
+    for n in nodes:
+        t = (n.get("contentDesc") or "") + (n.get("text") or "")
+        if any(w in t for w in TILE_WORDS) and n["bounds"]["top"] < 900 and n["clickable"]:
+            return n
+    return None
+
+
+SECURE_DB = os.path.join(WORK, "secure.json")
+SHOT_NAME = re.compile(r"^Screenshot_(\d{8})_(\d{6})\.(?:jpg|jpeg|png)$", re.I)
+LEFTOVER = [""]          # 没删掉的那张，收尾时提一句
+
+
+def secure_map():
+    try:
+        return json.load(open(SECURE_DB))
+    except Exception:                                          # noqa: BLE001
+        return {}
+
+
+def mark_secure(pkg, flag=True):
+    m = secure_map()
+    if flag:
+        m[pkg] = int(time.time())
+    else:
+        m.pop(pkg, None)
+    os.makedirs(WORK, exist_ok=True)
+    json.dump(m, open(SECURE_DB, "w"))
+
+
+SECURE_HINTS = ("secure", "privacy", "隐私", "禁止截图", "不允许截屏", "black")
+SHOT_SEQ = [0]
+
+
+def _ruler(im, d):
+    """在缩略图上画设备像素刻度：细线每 200px，左上两侧标数字每 400px。
+
+    目的：**只保留一套坐标**。模型看的是 640×1386 的图，但图上每格都标着设备像素值，
+    所以"读图 → 给 xy"全程都是设备像素，不再有 ×2 换算，也不会两套坐标打架。
+    """
+    try:
+        from PIL import ImageDraw
+        dr = ImageDraw.Draw(im)
+        sc = d["scale"]
+        for x in range(200, d["w"], 200):
+            px = int(x * sc)
+            dr.line([(px, 0), (px, im.height)], fill=(185, 185, 185), width=1)
+        for y in range(200, d["h"], 200):
+            py = int(y * sc)
+            dr.line([(0, py), (im.width, py)], fill=(185, 185, 185), width=1)
+        for x in range(400, d["w"], 400):
+            dr.text((int(x * sc) + 2, 2), str(x), fill=(220, 0, 0))
+        for y in range(400, d["h"], 400):
+            dr.text((2, int(y * sc) + 1), str(y), fill=(220, 0, 0))
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def _shrink(src, keep_full=False):
+    """统一缩到"屏幕 × device.scale"（这台是 1280×2772 → 640×1386），并**删掉原图**。
+
+    三条都必须做，少一条就会堆缓存（2026-11-16 实测堆到 182 张 / 124 MB）：
+      1. 原图只用一次，缩完立刻 os.remove —— 旧的通知栏路径本来就有这行，换通道时丢了；
+      2. 小图存 JPEG(80)，不要 PNG：单张 120KB vs 670KB，差 5 倍；
+      3. 小图按 KEEP 保留最近几张，因为要留给"点之前/点之后"两张做对比。
+    """
+    os.makedirs(WORK, exist_ok=True)
+    d = dev()
+    tw, th = int(d["w"] * d["scale"]), int(d["h"] * d["scale"])
+    SHOT_SEQ[0] += 1
+    small = os.path.join(WORK, f"view_{int(time.time()*1000)}_{SHOT_SEQ[0]}.jpg")
+    try:
+        from PIL import Image
+        im = Image.open(src).convert("RGB")
+        if im.size != (tw, th):
+            im = im.resize((tw, th), Image.LANCZOS)
+        _ruler(im, d)
+        im.save(small, "JPEG", quality=80)
+        if keep_full:
+            im.save(os.path.join(WORK, "full_" + os.path.basename(small)), "JPEG", quality=92)
+        ok = True
+    except Exception as e:                                     # noqa: BLE001
+        # 缩图失败就别返回 src：finally 会把 src 删掉，返回一条已不存在的路径
+        # 会让上层把 404 链接交给模型（PIL 缺失/图损坏/磁盘满时都可能）。
+        print(f"… 缩图失败：{type(e).__name__}: {e}")
+        return None
+    finally:
+        # 原图（无障碍 takeScreenshot 落在 attachments/screenshots/ 的那张）用完即删
+        if 'ok' in dir() and src != small:
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+    prune()
+    return small
+
+
+PRUNE_OK = re.compile(r"^(view|shot|full|prev)[_\w-]*\.(jpg|png)$")
+
+
+def prune():
+    """只删自己拍的历史截图，别的一律不动。
+
+    WORK 里同时住着 lastlook.json（sN 记录）和 secure.json（哪些 App 禁截屏）：
+    按 mtime 无差别删会把它们清掉，于是 sN 保护失效、"禁截屏"缓存每轮重试。
+    """
+    try:
+        fs = [f for f in os.listdir(WORK) if PRUNE_OK.match(f)]
+        fs.sort(key=lambda x: os.path.getmtime(os.path.join(WORK, x)))
+        for f in fs[:-KEEP * 2]:
+            try:
+                os.remove(os.path.join(WORK, f))
+            except OSError:
+                pass
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def shot(keep_full=False):
+    """截一张图，返回 (看图路径, 错误码)。
+
+    首选无障碍 takeScreenshot（1.5–3s，不碰相册、不依赖通知栏磁贴）。
+    旧实现走"拉通知栏点截屏磁贴 + 相册取图"，这台机的通知栏里根本没有那个磁贴，
+    直接 NO_TILE；保留成 shot_tile 只作兜底。
+    """
+    front = info().get("packageName", "")
+    if time.time() - secure_map().get(front, 0) < 3600:
+        return None, "SECURE"
+    d = a11y("ui", "screenshot", t=25)
+    if d.get("ok"):
+        src = ((d.get("data") or {}).get("path")) or ""
+        if src and os.path.exists(src):
+            small = _shrink(src, keep_full)
+            return (small, None) if small else (None, "SHRINK_FAILED")
+        return None, "NO_PATH"
+    err = json.dumps(d.get("error") or {}, ensure_ascii=False)
+    if any(h in err.lower() for h in SECURE_HINTS):
+        mark_secure(front)
+        return None, "SECURE"
+    path, e2 = shot_tile(keep_full)
+    if path:
+        return path, None
+    code = (d.get("error") or {}).get("code", "A11Y_FAIL")
+    return None, f"{code}/{e2}"
+
+
+def shot_tile(keep_full=False):
+    os.makedirs(WORK, exist_ok=True)
+    front = info().get("packageName", "")
+    if time.time() - secure_map().get(front, 0) < 3600:
+        return None, "SECURE"
+    nodes = raw_nodes()
+    tile = find_tile(nodes)
+    if not tile:                       # 通知栏没开
+        a11y("input", "key", "notifications")
+        for _ in range(8):
+            time.sleep(0.12)
+            nodes = raw_nodes()
+            tile = find_tile(nodes)
+            if tile:
+                break
+    if not tile:
+        return None, "NO_TILE"
+    last = photos(1)
+    if last is None:
+        return None, "PHOTO_DB_UNREADABLE"      # 查不到相册：和"没出图"是两回事
+    last_id = last[0]["id"] if last else 0
+    a11y("tap", "node", tile["nodeId"])
+    t0 = time.time()
+    found = None
+    while time.time() - t0 < 5:
+        m = photos(1)
+        if m is None:
+            return None, "PHOTO_DB_UNREADABLE"
+        if m and m[0]["id"] > last_id and SHOT_NAME.match(m[0].get("name") or ""):
+            found = m[0]
+            break
+        time.sleep(0.15)
+    if not found:
+        # 没落盘通常是系统拒绝截屏（App 开了截屏保护）。查通知栏确认，别猜。
+        a11y("input", "key", "notifications")
+        time.sleep(0.7)
+        denied = False
+        try:
+            for n in raw_nodes():
+                t = (n.get("text") or "") + (n.get("contentDesc") or "")
+                if "隐私" in t or "无法捕获" in t or "不允许截屏" in t:
+                    denied = True
+                    break
+        except Exception:                                      # noqa: BLE001
+            pass
+        a11y("input", "key", "back")
+        if denied:
+            mark_secure(front)
+            return None, "SECURE"
+        return None, "NO_NEW_SHOT"
+    p = subprocess.run(["android-photos", "export", "--id", str(found["id"]),
+                        "--size", "original"], capture_output=True, text=True)
+    try:
+        src = json.loads(p.stdout)["linux_path"]
+    except Exception:                                          # noqa: BLE001
+        return None, f"EXPORT_FAIL: {(p.stdout or p.stderr).strip()[:120]}"
+    dst = os.path.join(WORK, f"shot_{found['id']}.jpg")
+    small = os.path.join(WORK, f"view_{found['id']}.jpg")
+    try:
+        from PIL import Image
+        im = Image.open(src).convert("RGB")
+        w, h = im.size
+        im.resize((w // 2, h // 2), Image.LANCZOS).save(small, "JPEG", quality=80)
+        if keep_full:
+            im.save(dst, "JPEG", quality=88)
+        os.remove(src)
+    except Exception as e:                                     # noqa: BLE001
+        return None, f"PIL {e}"
+    for f in sorted(os.listdir(WORK), key=lambda x: os.path.getmtime(os.path.join(WORK, x)))[:-KEEP * 2]:
+        try:
+            os.remove(os.path.join(WORK, f))
+        except OSError:
+            pass
+    # 只按这一张的 id 删一次；删没删掉以 deleted_count 为准，不信"看起来删了"。
+    # 删不掉就把 id 和文件名交出去，由调用方判断，不在这里反复重试。
+    r = subprocess.run(["android-photos", "delete", "--ids", str(found["id"]),
+                        "--confirm"], capture_output=True, text=True)
+    try:
+        n = int(json.loads(r.stdout or "{}").get("deleted_count") or 0)
+    except Exception:                                          # noqa: BLE001
+        n = 0
+    LEFTOVER[0] = "" if n >= 1 else f'{found["name"]}(id={found["id"]})'
+    # 万一系统截屏编辑器抢了前台，退掉
+    wk = info().get("packageName", "")
+    if any(h in wk.lower() for h in EDITOR_HINTS):
+        a11y("input", "key", "back")
+        time.sleep(0.2)
+    return small, None
+
+
+def diff(path_new, path_old):
+    try:
+        from PIL import Image, ImageChops, ImageStat
+        a = Image.open(path_new).convert("L")
+        b = Image.open(path_old).convert("L").resize(a.size)
+        w, h = a.size
+        box = (0, int(h * 0.06), w, int(h * 0.98))   # 状态栏时钟/网速每秒都变，算进去会假阳
+        a, b = a.crop(box), b.crop(box)
+        st = ImageStat.Stat(ImageChops.difference(a, b))
+        return round(sum(st.mean) / len(st.mean) / 255 * 100, 1)
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+# ---------- 等待页面稳定 ----------
+LOADING = re.compile(r"加载|请稍候|Loading|刷新中")
+
+
+def watch(prev_sig, timeout=1500):
+    """轮询到"变了且停住"。页面在转圈就自动多等一会儿，别让模型白跑一趟。
+    返回 (items, sig, pkg, 用时ms, changed)。"""
+    t0 = time.time()
+    last = None
+    while True:
+        nodes = raw_nodes()
+        items = build(nodes)
+        s = sig(items)
+        spinning = any(LOADING.search(l) for l, _ in items)
+        if s != prev_sig and s == last and not spinning:
+            return items, s, info().get("packageName", "?"), int((time.time() - t0) * 1000), True
+        last = s
+        if (time.time() - t0) * 1000 >= (timeout * 2.5 if spinning else timeout):
+            return items, s, info().get("packageName", "?"), int((time.time() - t0) * 1000), s != prev_sig
+        time.sleep(0.12)
+
+
+# ---------- 找目标 ----------
+def find(items, target, nth=0):
+    if re.fullmatch(r"s\d+", target):
+        i = int(target[1:]) - 1
+        return [items[i]] if 0 <= i < len(items) else []
+    t = target.strip()
+    exact = [it for it in items if it[0] == t]
+    if exact:
+        return exact
+    return [it for it in items if t and t in it[0]]
+
+
+def show_cands(c, target):
+    print(f"✘ 无法确定 “{target}”，命中 {len(c)} 个，先看清楚再点：")
+    for i, it in enumerate(c[:6], 1):
+        print(f"  s{i}  {it[0][:30]} @{it[1]['center']['x']},{it[1]['center']['y']}")
+
+
+def tap_node(n, items_index=None):
+    r = a11y("tap", "node", n["nodeId"])
+    if r.get("ok"):
+        return "node"
+    c = n["center"]
+    r = a11y("tap", "xy", str(c["x"]), str(c["y"]))
+    return "xy" if r.get("ok") else "fail"
+
+
+# ---------- 子命令 ----------
+def cmd_look(a):
+    items, s, pkg, nodes = snap()
+    remember_look(s)
+    if len(items) < 3 or a.shot:
+        pixel_mode = len(items) < 3
+        if pixel_mode and pkg in secure_map():
+            print(f"app {pkg} · 本地无节点 · 该窗口禁止截屏（截屏保护）")
+            print("  这一类界面 AI 看不到也点不准：请用户手动操作，或换桌面/网页入口")
+            if items:
+                print(render(items))
+            return
+        path, err = shot()
+        print(f"app {pkg} · 节点 {len(items)} 项 · 像素模式" if pixel_mode else header(pkg, items))
+        if path:
+            print(f"shot {path}")
+            print(f"url  minis://workspace/shots/{os.path.basename(path)}")
+            print("  图上已画设备像素刻度：照红字数值给 scr xy（不要再乘 2）")
+        elif err == "SECURE":
+            print("✘ 该窗口禁止截屏（App 开了截屏/隐私保护）——AI 看不到这一屏，别硬点")
+        else:
+            print(f"✘ 截图失败 {err}")
+        if items:
+            print(render(items))
+        return
+    emit(items, pkg, nodes)
+
+
+def cmd_tap(a):
+    items0, s0, pkg0, _ = snap()
+    if re.fullmatch(r"s\d+", a.target):
+        why = look_stale(s0)
+        if why:
+            print(f"✘ 不用 {a.target} 点：{why}。下面是最新一屏，用 sN 重新指或直接给文字：")
+            print(render(items0))
+            sys.exit(1)
+    cand = find(items0, a.target, a.nth)
+    if not cand:
+        print(f"✘ 当前屏 {len(items0)} 项里没有 “{a.target}”（下面是这一屏的全部条目）")
+        if items0:
+            if not os.environ.get("SCR_QUIET"):
+                print(render(items0))
+        sys.exit(1)
+    if len(cand) > 1 and a.nth is None:
+        show_cands(cand, a.target)
+        print("  确认是哪一个：加 --nth 序号，或用上面的 sN")
+        sys.exit(1)
+    if a.nth is not None and not (1 <= a.nth <= len(cand)):
+        print(f"✘ --nth {a.nth} 超出候选范围（本屏 {len(cand)} 个候选）")
+        for i, (lb, _n) in enumerate(cand, 1):
+            print(f"   候选{i}: {lb}")
+        sys.exit(2)
+    label, node = cand[(a.nth - 1) if a.nth else 0]
+    how = tap_node(node)
+    if how == "fail":
+        print(f"✘ 点击注入失败：{(r.get('error') or {}).get('code')} {(r.get('error') or {}).get('message','')[:80]}")
+        sys.exit(2)
+    items, s, pkg, ms, changed = watch(s0, a.timeout)
+    mark = "✔" if changed else "…"
+    line = f"{mark} tap “{label or '(无标签)'}” via {how} · {ms}ms · {'变' if changed else '无变化'}"
+    if a.expect:
+        hit = any(re.search(a.expect, it[0]) for it in items)
+        line += f" · 预期{'成立' if hit else '未出现!'}"
+    print(line)
+    emit(items, pkg)
+
+
+def cmd_xy(a):
+    x, y = int(a.x), int(a.y)
+    if a.scale and a.scale != 1:
+        x, y = int(x * a.scale), int(y * a.scale)
+    W, H = _scrn()
+    if not (0 <= x < W and 0 <= y < H):        # 越界坐标会静默点空，必须当场拒绝
+        print(f"✘ 坐标 {x},{y} 超出屏幕 {W}×{H}：设备像素应在这个范围内；"
+              f"给的是截图坐标就加 --scale 2")
+        sys.exit(2)
+    pre = None
+    if a.verify:
+        pre = os.path.join(WORK, "prev.jpg")
+        p, _ = shot()
+        if p:
+            subprocess.run(["cp", p, pre])
+    items0, s0, _, _ = snap()
+    r = a11y("tap", "xy", str(x), str(y))
+    if not r.get("ok"):
+        print(f"✘ 点击失败 {r.get('error')}")
+        sys.exit(2)
+    if a.verify and pre and os.path.exists(pre):
+        items, s, pkg, ms, changed = watch(s0, a.timeout)
+        post, err = shot()
+        d = diff(post, pre) if post else None
+        print(f"{'✔' if (d or 0) > 0.15 else '…'} xy {x},{y} · 页面{'变' if changed else '未变'}"
+              f" · 像素差 {d if d is not None else err}% · {ms}ms")
+        if post:
+            print(f"shot {post}")
+            print(f"url  minis://workspace/shots/{os.path.basename(post)}")
+    else:
+        items, s, pkg, ms, changed = watch(s0, a.timeout)
+        print(f"{'✔' if changed else '…'} xy {x},{y} · {ms}ms · {'页面变了' if changed else '页面没动'}")
+    if items:
+        emit(items, pkg)
+
+
+def cmd_type(a):
+    nodes = raw_nodes()
+    items = build(nodes)
+    tgt = None
+    if a.into:
+        cand = find(items, a.into)
+        if len(cand) != 1:
+            show_cands(cand, a.into) if cand else print(f"✘ 没有 “{a.into}”")
+            sys.exit(1)
+        tgt = cand[0][1]
+    focused = [n for n in nodes if n["editable"] and n["focused"]]
+    if not focused and tgt is None:
+        eds = [n for n in nodes if n["editable"]]
+        if not eds:
+            print("✘ 这一屏没有可写输入框：先 tap 到编辑态，或该 App 根本没暴露输入框")
+            sys.exit(1)
+        tgt = eds[0]
+    if not a.text.strip():
+        print("✘ 要输入的内容是空的")
+        sys.exit(2)
+    if tgt is not None:
+        tap_node(tgt)
+        time.sleep(0.35)
+    r = a11y("input", "text", a.text)
+    if not r.get("ok"):
+        print(f"✘ 写入失败 {r.get('error')}")
+        sys.exit(2)
+    time.sleep(0.2)
+    nodes = raw_nodes()
+    # 只看"我们点进去的那个输入框"现在的文本：整棵树里搜子串会把"打进别处"也算成功。
+    ids = {tgt["nodeId"]} if tgt is not None else {n["nodeId"] for n in nodes if n.get("editable")}
+    got = next((n for n in nodes if n["nodeId"] in ids and a.text in (n.get("text") or "")), None)
+    items = build(nodes)
+    if got:
+        print(f"✔ type “{a.text[:30]}” · 输入框当前文本：{(got.get('text') or '')[:40]}")
+    else:
+        cur = next((n.get("text") for n in nodes if n["nodeId"] in ids), None)
+        print(f"✘ type “{a.text[:30]}” · 写入后输入框文本是 {cur!r}，没有包含要输入的内容")
+    emit(items, info().get("packageName", "?"))
+    if not got:
+        sys.exit(1)
+
+
+KEYMAP = {"back": "back", "返回": "back", "home": "home", "主页": "home",
+          "enter": "enter", "回车": "enter", "notif": "notifications",
+          "通知": "notifications", "recents": "app_switch", "多任务": "app_switch"}
+
+
+def cmd_key(a):
+    items0, s0, _, _ = snap()
+    k = KEYMAP.get(a.name, a.name)
+    r = a11y("input", "key", k)
+    if not r.get("ok"):
+        print(f"✘ 按键失败 {r.get('error')}")
+        sys.exit(2)
+    items, s, pkg, ms, changed = watch(s0, a.timeout)
+    print(f"{'✔' if changed else '…'} key {k} · {ms}ms · {'页面变了' if changed else '页面没动'}")
+    if items:
+        emit(items, pkg)
+
+
+def cmd_swipe(a):
+    """滑动。起止点按当前屏幕算——旧版写死 1080×2400，换到 1280×2772 会甩到屏外。"""
+    W, H = screen_size()
+    cx, cy = W // 2, int(H * 0.46)      # 0.46 落在内容区中段：避开顶部死区与底部 Dock/手势条
+    m = max(200, min(a.dist or 800, int(H * 0.3)))
+    fx, fy, tx, ty = {
+        "up": (cx, cy + m // 2, cx, cy - m // 2),
+        "down": (cx, cy - m // 2, cx, cy + m // 2),
+        "left": (cx + m // 2, cy, cx - m // 2, cy),
+        "right": (cx - m // 2, cy, cx + m // 2, cy),
+    }[a.dir]
+    items0, s0, _, _ = snap()
+    r = a11y("gesture", "swipe", str(fx), str(fy), str(tx), str(ty))
+    if not r.get("ok"):
+        e = r.get("error") or {}
+        print(f"✘ swipe {a.dir} 注入失败：{e.get('code')} {e.get('message','')[:100]}")
+        emit(items0, info().get("packageName", ""))
+        sys.exit(2)
+    items, s, pkg, ms, changed = watch(s0, 1200)
+    print(f"{'✔' if changed else '…'} swipe {a.dir} · {ms}ms · "
+          f"{'内容动了' if changed else f'注入成功，{ms}ms 内内容未变'}")
+    emit(items, pkg)
+
+
+APPS = {
+    "微信": "com.tencent.mm", "wechat": "com.tencent.mm",
+    "设置": "com.android.settings", "settings": "com.android.settings",
+    "相机": "com.android.camera", "相册": "com.miui.gallery", "图库": "com.miui.gallery",
+    "浏览器": "com.android.browser", "短信": "com.android.mms",
+    "电话": "com.android.contacts", "日历": "com.android.calendar",
+    "时钟": "com.android.deskclock", "计算器": "com.miui.calculator",
+    "文件": "com.android.fileexplorer", "文件管理": "com.android.fileexplorer",
+    "桌面": "com.miui.home", "应用商店": "com.xiaomi.market",
+    "手机管家": "com.miui.securitycenter",
+    "哔哩哔哩": "tv.danmaku.bili", "bilibili": "tv.danmaku.bili", "b站": "tv.danmaku.bili",
+}
+
+# 只有 package 解析不到启动 Activity 的 App 才需要写在这里
+COMP = {
+    "com.tencent.mm": "com.tencent.mm/.ui.LauncherUI",
+    "com.android.settings": "com.android.settings/.Settings",
+}
+
+
+def _label_of(pkg):
+    """包名 → 桌面显示名。优先含中文的那个键（"哔哩哔哩" 比 "bilibili" 更像图标标签）。"""
+    cand = [k for k, v in APPS.items() if v == pkg]
+    for k in cand:
+        if re.search(r"[\u4e00-\u9fa5]", k):
+            return k
+    return cand[0] if cand else None
+
+
+def _open_by_icon(label, max_pages=6):
+    """从桌面点图标拉起。当前页没有就往后翻，找完回到起始页。
+    返回 (是否点到, 观测到的事实)。事实只写"看了几页、看到几个图标、有没有匹配"，
+    不写"可能被隐藏/没装"这种推断。"""
+    if not label:
+        return False, "没有可用的显示名"
+    if info().get("packageName") != dev()["launcher"]:
+        a11y("input", "key", "home")
+        time.sleep(0.5)
+    d = dev()
+    cur, total = _page_of(raw_nodes())
+    total = min(total or 1, max_pages)
+    if cur and cur != 1:                       # 桌面会记住上次停的页，先回第 1 页再扫，否则扫不到前面页的图标
+        _goto_page(d, 1, total or 1)
+    start = cur or 1
+    seen, pages = 0, 0
+    if total > 1:
+        _warm_desktop()                        # HyperOS 平时不暴露图标，不预热就扫不到
+    try:
+        for i in range(total):
+            pages += 1
+            for n in raw_nodes():
+                if n.get("clickable"):
+                    seen += 1
+                    if lbl(n) == label:
+                        tap_node(n)
+                        return True, f"第 {cur or pages} 页命中"
+            if i == total - 1:
+                break
+            _swipe_page(d, +1)
+            nxt, _t = _wait_page(cur)
+            if nxt is None or nxt == cur:
+                break
+            cur = nxt
+    finally:
+        for _ in range(total + 1):        # 尽量还原到原来的页
+            c, _t = _page_of(raw_nodes())
+            if c is None or c <= start:
+                break
+            _swipe_page(d, -1)
+            _wait_page(c)
+    return False, f"扫了 {pages} 页 / {seen} 个可点节点，没有名为“{label}”的"
+
+
+def _open_by_recents(label):
+    """从最近任务点卡片拉起。卡片 contentDesc 形如「哔哩哔哩,未加锁」。"""
+    if not label:
+        return False
+    a11y("input", "key", "RECENTS")
+    time.sleep(0.9)
+    cards = 0
+    for _ in range(5):
+        for n in raw_nodes():
+            cd = (n.get("contentDesc") or "").strip()
+            if not cd:
+                continue
+            head = re.split(r"[,，]", cd)[0].strip()
+            if re.match(r"^[^,，]+[,，](未加锁|已加锁|未锁定)$", cd):
+                cards += 1                     # 只数真正的任务卡片，别把普通节点也算进来
+            if head == label and n.get("clickable"):
+                tap_node(n)
+                return True, "最近任务里点中卡片"
+        time.sleep(0.25)
+    a11y("input", "key", "back")          # 最近任务里没找到，退出，别把用户留在任务视图
+    time.sleep(0.4)
+    return False, f"最近任务 {cards} 张卡片，没有“{label}”"
+
+
+def _via_note(now, pkg):
+    return "" if now == pkg else f" · 前台实际是 {now}"
+
+
+def _open_in_folders(label, max_folders=12):
+    """图标被收进文件夹时，按页扫是扫不到的——逐个文件夹打开找。
+
+    桌面图标被整理进文件夹是常态（这台机 18 个格子里 10 个是文件夹），
+    不翻文件夹就等于"App 装没装全看运气"。找到就点，其余原路退回。
+    """
+    if not label:
+        return False, "没有可用的显示名"
+    all_folders = [(x, y) for t, x, y in _icons_normal()[0] if t == "(文件夹)"]
+    folders = all_folders[:max_folders]
+    for i, (x, y) in enumerate(folders):
+        a11y("tap", "xy", str(x), str(y))
+        time.sleep(0.55)
+        for n in raw_nodes():
+            if n.get("clickable") and lbl(n) == label:
+                tap_node(n)
+                return True, f"第 {i+1} 个文件夹里找到"
+        a11y("input", "key", "back")           # 没找到就退出来，别把用户留在文件夹里
+        time.sleep(0.3)
+    return False, f"翻了 {len(folders)} 个文件夹（本页共 {len(all_folders)} 个），没有“{label}”"
+
+
+def cmd_open(a):
+    pkg = APPS.get(a.target.lower(), a.target) if "." not in a.target else a.target
+    label = _label_of(pkg) or (a.target if "." not in a.target else None)
+    pkg0 = info().get("packageName", "")
+    t0 = time.time()
+    if pkg0 == pkg:                      # 已经在前台就别再发 intent（会重启、弹广告）
+        items, _s, now, nodes = snap()
+        print(f"✔ already {pkg} · 不重启")
+        emit(items, now, nodes)
+        return
+
+    launcher = dev()["launcher"]
+
+    def front_is_target(timeout=1.6):
+        """只看"前台是不是目标包"会误判：App 首启弹隐私/权限页时，前台是
+        com.miui.securitycenter 这类系统包，但 App 确实起来了。所以放行条件两条：
+        ① 前台就是目标包；② 已经离开桌面、且不是原来的前台（= 真的跳走了）。
+        故意不开"只要前台变了就算成功"的口子——那条会把"按home回到桌面"当成功，
+        老版本就是这样把 B 站的启动失败报成了 ✔。"""
+        end = time.time() + timeout
+        while time.time() < end:
+            now = info().get("packageName", "")
+            if now == pkg:
+                return True, now
+            if now and now != pkg0 and now != launcher and not now.endswith(".launcher"):
+                return True, now
+            time.sleep(0.12)
+        return False, info().get("packageName", "")
+
+    tried, obs = [], []
+    # ① intent：这台机上 android-open 不认 intent: URI（返回 no_handler），
+    #    但别的 Android 上可用，所以留着，只是必须校验它真的返回成功。
+    comp = COMP.get(pkg)
+    uri = ("intent:#Intent;action=android.intent.action.MAIN;category=android.intent.category.LAUNCHER;"
+           + (f"component={comp};end" if comp else f"package={pkg};end"))
+    try:
+        r = subprocess.run(["android-open", uri], capture_output=True, text=True, timeout=10)
+        out = (r.stdout or "") + (r.stderr or "")
+        open_ok = r.returncode == 0 and '"error"' not in out.lower()
+    except subprocess.TimeoutExpired:
+        out, open_ok = "android-open 超时（10s）", False
+    tried.append("intent")
+    ok1, now1 = front_is_target(2.0) if open_ok else (False, "")
+    if ok1:
+        items, s, now, _ = snap()
+        print(f"✔ open {pkg} via intent · {int((time.time()-t0)*1000)}ms" + _via_note(now, pkg))
+        emit(items, now)
+        return
+    # ② 桌面图标 / ③ 最近任务
+    # 顺序按"便宜且常见"排：当前页图标/文件夹（本地、最快）→ 最近任务 → 全页扫描。
+    # 文件夹必须在全页扫描之前：桌面上的图标本来就大量收在文件夹里，先扫全页会白等 10s。
+    for name, fn in (("当前页图标", lambda: _open_by_icon(label, max_pages=1)),
+                     ("当前页文件夹", lambda: _open_in_folders(label)),
+                     ("最近任务", lambda: _open_by_recents(label)),
+                     ("桌面图标", lambda: _open_by_icon(label))):
+        tried.append(name)
+        hit, note = fn()
+        obs.append(f"{name}：{note}")
+        ok2, now2 = front_is_target(2.2) if hit else (False, "")
+        if ok2:
+            items, s, now, _ = snap()
+            print(f"✔ open {pkg} via {name}（{label}）· {int((time.time()-t0)*1000)}ms" + _via_note(now, pkg))
+            emit(items, now)
+            return
+
+    items, s, now, _ = snap()
+    ms = int((time.time() - t0) * 1000)
+    print(f"✘ open {pkg} 失败 · {ms}ms · 前台仍是 {now}")
+    print(f"   找的名字：「{label or '（包名解析不到显示名）'}」；各路由看到的事实：")
+    for o in obs:
+        print(f"   · {o}")
+    emit(items, now)
+    sys.exit(1)
+
+def cmd_wait(a):
+    t0 = time.time()
+    try:
+        pat = re.compile(a.target)
+    except re.error:                 # 输入里带 ( [ * 等：按字面找，别把用户输入当正则崩掉
+        pat = None
+        print(f"… “{a.target}” 不是合法正则，按字面匹配")
+    while (time.time() - t0) * 1000 < a.timeout:
+        items, s, pkg, _ = snap()
+        hit = any((pat.search(it[0]) if pat else a.target in it[0]) for it in items)
+        if hit != a.gone:
+            print(f"✔ {'出现' if hit else '消失'} “{a.target}” · {int((time.time()-t0)*1000)}ms · app {pkg}")
+            emit(items, pkg, _LAST["nodes"])       # 等到了就把这一屏贴回来，别让调用方再补一次 look
+            return
+        time.sleep(0.15)
+    items, s, pkg, _ = snap()
+    print(f"✘ 超时 {a.timeout}ms，“{a.target}” 未{'消失' if a.gone else '出现'} · app {pkg}")
+    emit(items, pkg)
+    sys.exit(1)
+
+
+def cmd_state(a):
+    items, s, pkg, _ = snap()
+    remember_look(s)
+    print(f"app {pkg} · {len(items)} 项 · sig {s}")
+
+
+def cmd_shot(a):
+    path, err = shot(keep_full=a.full)
+    if LEFTOVER[0]:
+        print(f"⚠ 相册里可能残留 {LEFTOVER[0]}，删不掉，收尾时提醒用户手动删")
+    if not path:
+        print(f"✘ 截图失败 {err}")
+        sys.exit(1)
+    print(f"shot {path}")
+    print(f"url  minis://workspace/shots/{os.path.basename(path)}")
+
+
+# ---------- 桌面布局：读 / 搬 ----------
+EDIT_CHROME = {"完成", "壁纸", "壁纸效果", "小部件", "桌面设置"}
+PAGE_RE = re.compile(r"第\s*(\d+)\s*页共\s*(\d+)\s*页")
+BUBBLE = ("点按相应功能", "Minis 无障碍")
+
+
+def _page_of(nodes):
+    for n in nodes:
+        m = PAGE_RE.search(lbl(n))
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return None, None
+
+
+def _edit_mode(on=True):
+    """进/退桌面编辑模式，返回是否处于该模式。
+
+    为什么要进编辑模式：普通桌面下 HyperOS 一个图标节点都不暴露（只有状态栏），
+    长按空白进"编辑"后，34 个图标全变成带坐标的可读节点——这是精确读布局的唯一入口。
+    """
+    W, H = screen_size()
+    for n in raw_nodes():
+        if lbl(n) == "完成":
+            if on:
+                return True
+            a11y("tap", "node", n["nodeId"])
+            time.sleep(0.7)
+            return False
+    if not on:
+        return True
+    # 空白点长按：0.78H 一带（最后一行与页码点之间）通常没图标，备用两档
+    for fy in (0.78, 0.86, 0.70):
+        for fx in (0.5, 0.12, 0.88):
+            a11y("tap", "xy", str(int(W * fx)), str(int(H * fy)), "--long")
+            time.sleep(1.0)
+            if any(lbl(n) == "完成" for n in raw_nodes()):
+                return True
+    return False
+
+
+def _icons_now():
+    """编辑模式下的图标清单 [(name, x, y)]，按网格容差过滤掉工具条/气泡。"""
+    d = dev()
+    nodes = raw_nodes()
+    W, H = screen_size()
+    gx, gy = d["grid_x"], d["grid_y"]
+    tol_x, tol_y = 90, 110      # 半个格子内：再大就可能是工具条/Dock
+    out = []
+    for n in nodes:
+        t = lbl(n)
+        if not n["clickable"] or t in EDIT_CHROME:
+            continue
+        if not t:                       # 编辑模式下没文字却占一格 = 文件夹，不能算空位
+            cx0, cy0 = n["center"]["x"], n["center"]["y"]
+            if (min(abs(cx0 - x) for x in gx) <= tol_x
+                    and min(abs(cy0 - y) for y in gy) <= tol_y):
+                out.append(("(文件夹)", cx0, cy0))
+            continue
+        if any(b in t for b in BUBBLE) or PAGE_RE.search(t):
+            continue
+        cx, cy = n["center"]["x"], n["center"]["y"]
+        if min(abs(cx - x) for x in gx) > tol_x or min(abs(cy - y) for y in gy) > tol_y:
+            continue
+        out.append((t, cx, cy))
+    return out
+
+
+def _cell(x, y):
+    d = dev()
+    col = min(range(len(d["grid_x"])), key=lambda i: abs(x - d["grid_x"][i])) + 1
+    row = min(range(len(d["grid_y"])), key=lambda i: abs(y - d["grid_y"][i])) + 1
+    return row, col
+
+
+def _swipe_page(d, step):
+    """step=+1 下一屏，-1 上一屏。走 0.46H，避开顶部死区和底部 Dock。"""
+    W, H = screen_size()
+    y = int(H * 0.46)
+    x1, x2 = (int(W * 0.8), int(W * 0.25)) if step > 0 else (int(W * 0.25), int(W * 0.8))
+    a11y("gesture", "swipe", str(x1), str(y), str(x2), str(y), "300")
+
+
+def _wait_page(prev, timeout=2.5):
+    """翻页后等页码真的变（编辑模式里"第 N 页共 M 页"是权威信号）。
+    不等就拍是这次踩的坑：连拍三张同一页，然后一下跳过一整页。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        cur, total = _page_of(raw_nodes())
+        if cur is not None and cur != prev:
+            time.sleep(0.15)
+            return cur, total
+        time.sleep(0.08)
+    cur, total = _page_of(raw_nodes())
+    return cur, total
+
+
+def _icons_normal():
+    """普通桌面下的图标清单 [(name, x, y)]，外加小部件。
+
+    坐标口径与 look/xy 一致（节点中心）。为什么不用编辑模式：编辑模式是缩略布局，
+    豌豆荚 502,560 / 计算器 227,1156，普通桌面是 489,407 / 188,1059，差 40–150px，
+    按编辑模式的坐标点会落到邻格。
+    过滤用区域而不是"离格子中心多近"：后者会把 2×2 小部件（系统工具中心 940,1560，
+    离最近的格子中心 150px）当噪声丢掉。
+    """
+    d = dev()
+    gx, gy = d["grid_x"], d["grid_y"]
+    out, widgets, seen = [], [], set()
+    for n in raw_nodes():
+        t = lbl(n)
+        if t and (PAGE_RE.search(t) or t in EDIT_CHROME):
+            continue
+        if not n.get("clickable") and not t:
+            continue
+        b = n.get("bounds") or {}
+        x, y = n["center"]["x"], n["center"]["y"]
+        if not (150 <= x <= 1150 and 280 <= y <= 2185):
+            continue                          # 状态栏 / 页码点 / Dock
+        area = (b.get("right", 0) - b.get("left", 0)) * (b.get("bottom", 0) - b.get("top", 0))
+        W, H = _scrn()
+        if area > 0.45 * W * H:
+            continue                          # 整屏容器（壁纸/根布局），不是小部件
+        if area > 180000:                     # 一格约 301×326=98k，两格以上算小部件
+            if not t and widgets:
+                continue                      # 无名的嵌套容器：跟着小部件一起出现，跳过
+            if (t, x, y) not in seen:
+                seen.add((t, x, y))
+                widgets.append((t or "(小部件)", x, y))
+            continue
+        t = t or "(文件夹)"                   # 普通桌面上文件夹节点没有文字
+        if (t, x, y) in seen:
+            continue
+        seen.add((t, x, y))
+        out.append((t, x, y))
+    return out, widgets
+
+
+def _goto_page(d, target, total):
+    """按页码节点翻到 target 页（撞边不动，多滑几次是安全的）。"""
+    for _ in range(total + 2):
+        c, _t = _page_of(raw_nodes())
+        if c is None or c == target:
+            return c
+        _swipe_page(d, -1 if c > target else +1)
+        _wait_page(c)
+    return None
+
+
+def _warm_desktop():
+    """让普通桌面把图标暴露进无障碍树（读布局前的"预热"）。
+
+    HyperOS 桌面平时只暴露 Dock 和页码，页面上的图标一个都不给（实测：28 个节点，
+    可点的只有夸克/电话/微信/QQ）。进出一次编辑模式之后，图标会在普通桌面上暴露
+    一段时间，且坐标是**普通桌面那一套**——编辑模式里图标是缩略布局，豌豆荚 502,560、
+    计算器 227,1156，而普通桌面是 489,407 / 188,1059，差 40–150px，按编辑模式的坐标
+    去点正好落到邻格（我据此点开过 ToDesk）。
+    """
+    if _icons_normal()[0]:
+        return True
+    d = dev()
+    W, H = _scrn()
+    for fy in (0.78, 0.86, 0.70):
+        for fx in (0.5, 0.12, 0.88):
+            a11y("tap", "xy", str(int(W * fx)), str(int(H * fy)), "--long")
+            time.sleep(0.9)
+            done = [n for n in raw_nodes() if lbl(n) == "完成"]
+            if not done:
+                continue
+            a11y("tap", "xy", str(done[0]["center"]["x"]), str(done[0]["center"]["y"]))
+            time.sleep(0.9)
+            return bool(_icons_normal()[0])
+    return False
+
+
+def cmd_grid(a):
+    """把桌面读成一张表：页-行-列 / 名称 / 坐标。只读，不动布局、不进编辑模式。"""
+    d = dev()
+    W, H = _scrn()
+    pkg = info().get("packageName", "")
+    if pkg != d["launcher"]:
+        print(f"✘ 前台是 {pkg}，不是桌面（{d['launcher']}）：先 scr key home 再试")
+        sys.exit(1)
+    if not _warm_desktop():
+        print("✘ 桌面图标不可读（进出编辑模式也没让它们进无障碍树）：改用 scr look 或 scr shot 看图")
+        sys.exit(2)
+    cur, total = _page_of(raw_nodes())
+    start_page = cur or 1
+    total = total or a.pages or 5
+    _goto_page(d, 1, total)
+    pages = []
+    while True:
+        icons, wids = _icons_normal()
+        p, _t = _page_of(raw_nodes())
+        p = p or len(pages) + 1
+        if not pages and not icons:
+            print(f"✘ 桌面图标没进无障碍树（只拿到 {len(raw_nodes())} 个节点）："
+                  "这一屏没暴露内容，等 1s 重试，或直接用 scr shot 看图")
+            sys.exit(2)
+        pages.append((p, icons, wids))
+        if p >= total or len(pages) > total + 1:
+            break
+        _swipe_page(d, +1)
+        nxt, _t = _wait_page(p)
+        if nxt is None or nxt == p:
+            break
+        if not _icons_normal()[0]:        # 翻页会把暴露状态打回原形，重暖一次
+            _warm_desktop()
+    _goto_page(d, start_page, total)          # 扫完复位：每页格子坐标一样，停错页就会点错
+    lines = []
+    for p, icons, wids in pages:
+        table = {}
+        for name, x, y in icons:
+            table[_cell(x, y)] = (name, x, y)
+        empty = [f"{r}-{c}" for r in range(1, d["rows"] + 1)
+                 for c in range(1, d["cols"] + 1) if (r, c) not in table]
+        lines.append(f"页{p} · {len(icons)} 个图标 · 空位 {len(empty)}"
+                     + (f" · {', '.join(empty)}" if len(empty) <= 8 else ""))
+        for (r, c), (name, x, y) in sorted(table.items()):
+            lines.append(f"  {r}-{c}  {name:<20s} {x},{y}")
+        for name, x, y in wids:
+            lines.append(f"  小部件  {name:<18s} {x},{y}")
+    now_page, _t = _page_of(raw_nodes())
+    print(f"桌面 {d['cols']}×{d['rows']} · {W}×{H} · 共 {total} 页"
+          f" · 当前停在第 {now_page or start_page} 页")
+    print("\n".join(lines))
+    if a.json:
+        json.dump([{"page": p,
+                    "icons": [{"name": n, "x": x, "y": y,
+                               "row": _cell(x, y)[0], "col": _cell(x, y)[1]}
+                              for n, x, y in ic],
+                    "widgets": [{"name": n, "x": x, "y": y} for n, x, y in wd]}
+                   for p, ic, wd in pages],
+                  open(a.json, "w"), ensure_ascii=False, indent=1)
+        print(f"json {a.json}")
+
+def _dump_sig():
+    """当前屏的指纹：有节点就用节点，桌面一律返回 None（节点只有状态栏/气泡，比不出图标变化）。"""
+    if info().get("packageName") == dev()["launcher"]:
+        return None
+    try:
+        nodes = raw_nodes()
+    except SystemExit:
+        return None
+    items = build(nodes)
+    return sig(items) if len(items) >= 3 else None
+
+
+def _drag_a11y_continue(x1, y1, x2, y2, ms):
+    """API 层的正解，需要 CLI 支持 --continue。
+
+    Android 的 StrokeDescription 有 willContinue 标志，配 continueStroke() 可以做到
+    "这一段结束手指不抬起，下一段接着走"——正是"长按 → 拖动"要的东西。
+    但 android-a11y-cli 目前没暴露这个参数，所以先探一次：不认识就返回 None，退回抖动法。
+    """
+    hold = max(500, min(ms, 800))
+    r1 = a11y("gesture", "path", f"{x1},{y1}:{x1},{y1}", "--duration", str(hold), "--continue")
+    if not r1.get("ok"):
+        return None if (r1.get("error") or {}).get("code") == "INVALID_ARGS" else False
+    r2 = a11y("gesture", "path", f"{x1},{y1}:{x2},{y2}", "--duration", str(ms), "--continue")
+    return bool(r2.get("ok"))
+
+
+# ⚠️ 拖拽这条线怎么继续做（2026-11-17 20:20 定论，别走回头路）
+#
+# 需要实现/修复拖拽时，**就用抖动方式**：起点附近做 ±5~6px 的来回（不超触摸阈值），
+# 多抖几次把"几何长度"攒出来，再走移动段。原因：`gesture path` 的 `--duration` 是按
+# **路径长度**均匀采样的（实测 A/B/C，见 references/实测记录.md 第八节），原地重复同一个坐标长度=0，
+# 换不来一毫秒"按住"——早期"重复点=按住"的写法等于没按住。
+#
+# 已知边界（别指望调参解决）：
+#   · 桌面：抖动法偶发成功（今天两次成功搬动、反向一次全无反应），不可复现；
+#   · 文件夹内：必败。长按会弹系统菜单，窗口切换让注入流被 cancel（GESTURE_FAILED）；
+#   · 真"按住再移动"要 willContinue + continueStroke，本 CLI 不暴露（--continue 直接 unknown option）。
+# 要真正做稳，只能换通道：Shizuku `input draganddrop` 或 root 逐条注入 motionevent。
+
+
+def _drag_a11y_jitter(x1, y1, x2, y2, hold_ms=800, pick_ms=900, speed=500):
+    """抖动法拖拽：**一个连续过程，按下→按住→移动→落下，中间不停手、不抬手。**
+
+    `gesture path` 只收一个总时长，**按路径几何长度均分**（2026-11-17 实测，原"按点数"判断是错的），
+    所以重复点不占时间，塞一堆重复坐标换不来"按住"；要按住得让路径在触摸阈值内来回攒长度。
+    每点 42ms（本机实测最稳）。
+
+      ①拿起 pick_ms（默认 900）  ±3px 方波——测得低于 700ms 拿不起、高于 1100ms 变应用菜单
+      ②移动 按 speed 走         每点约 speed*42/1000 px（500px/s → 21px/点）。
+                                 旧版每点 123px≈2900px/s，是人的 7 倍，会被判成甩动
+      ③落点悬停 hold_ms（默认 800）原地抖动，不能停死（停死等于松手）
+      ④抬起前一瞬继续微动，抬手时手指仍在动，落点才不飘
+    """
+    MSPP = 42
+    box = 3        # ±3px：留在触摸阈值内，避免被当成滑页
+
+    def shiver(x, y, n):
+        return [(x + (box if i % 2 else -box), y + (box if (i // 2) % 2 else -box))
+                for i in range(n)]
+
+    dist = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+    step = max(8, speed * MSPP / 1000.0)          # 每点位移（px）
+    n_pick = max(2, int(pick_ms / MSPP))
+    n_move = max(2, int(dist / step))
+    n_hold = max(2, int(hold_ms / MSPP))
+    n_settle = 6
+    total = (n_pick + n_move + n_hold + n_settle) * MSPP
+    if total > 5200:                              # 实测 ≥5.9s 被系统取消（path cancelled），安全上限取 5.2s
+        n_hold = max(2, int((5200 - (n_pick + n_move + n_settle) * MSPP) / MSPP))
+        total = (n_pick + n_move + n_hold + n_settle) * MSPP
+    pts = shiver(x1, y1, n_pick)
+    pts += [(round(x1 + (x2 - x1) * i / n_move), round(y1 + (y2 - y1) * i / n_move))
+            for i in range(1, n_move + 1)]
+    pts += shiver(x2, y2, n_hold)
+    pts += shiver(x2, y2, n_settle)
+    path = ":".join(f"{px},{py}" for px, py in pts)
+    r = a11y("gesture", "path", path, "--duration", str(total))
+    return bool(r.get("ok"))
+
+
+def _order_cells(icons):
+    """当前页按阅读顺序（行优先）排好的格子 [(name, row, col, x, y)]。"""
+    d = dev()
+    out = []
+    for name, x, y in icons:
+        r, c = _cell(x, y)
+        out.append((name, r, c, d["grid_x"][c - 1], d["grid_y"][r - 1]))
+    out.sort(key=lambda t: (t[1], t[2]))
+    return out
+
+def cmd_drag_into(a):
+    """把图标拖进文件夹/格子：**落点按"抬起后"的布局算**，不是按拖之前。
+
+    为什么必须补偿（2026-11-18 实测定论）：图标一被拿起就跟着手指走，原格空出，
+    MIUI 立刻把后面的图标回填一格 —— 目标文件夹会往前移一位，手指底下已经不是它。
+    所以：目标在阅读顺序上位于起点之后时，落点要取"它前移一格后"的格子中心。
+
+    另外落点是**图标中心**要压住格子中心，不是手指坐标；两者默认按同一位置处理
+    （MIUI 图标跟指尖居中），实测有偏差时用 --grab-dx/--grab-dy 修。
+
+    用法：scr drag-into "咪咕音乐" r6c1 [--grab-dx 0 --grab-dy -20]
+    """
+    import re as _re
+    if not _warm_desktop():
+        print("✘ 桌面图标没进无障碍树（预热失败），无法安全读数：先 scr doctor")
+        sys.exit(2)
+    icons = _icons_normal()[0]
+    if not icons:
+        print("✘ 当前桌面读不到图标：先 scr doctor")
+        sys.exit(2)
+    cells = _order_cells(icons)
+    hits = [c for c in cells if c[0] == a.src] or [c for c in cells if a.src in c[0]]
+    if not hits:
+        print(f"✘ 当前页 {len(cells)} 个图标里没有 “{a.src}”：{', '.join(c[0] for c in cells)}")
+        sys.exit(1)
+    if len(hits) > 1:
+        print(f"✘ “{a.src}” 命中 {len(hits)} 个（{'、'.join(f'r{c[1]}c{c[2]}' for c in hits)}）：说全名")
+        sys.exit(1)
+    src = hits[0]
+    m = _re.fullmatch(r"[rR](\d)[cC](\d)", a.dst)
+    if not m:
+        print("✘ 目标要给格子，如 r3c1（文件夹在无障碍里没有文字，只能按格子指）")
+        sys.exit(2)
+    tr, tc = int(m.group(1)), int(m.group(2))
+    d = dev()
+    if not (1 <= tr <= len(d["grid_y"]) and 1 <= tc <= len(d["grid_x"])):
+        print(f"✘ 格子 {a.dst} 越界：本机 {len(d['grid_y'])} 行 × {len(d['grid_x'])} 列")
+        sys.exit(2)
+    # 抬起后回填：位于起点之后的项整体前移一位 → 目标的实际落点是"它前一位"的格子
+    idx_src = next(i for i, c in enumerate(cells) if c is src)
+    idx_dst = next((i for i, c in enumerate(cells) if c[1] == tr and c[2] == tc), None)
+    if not a.shift or idx_dst is None:
+        print(f"… 直接落 r{tr}c{tc}（对准格子中心；实测目标在落下前不会先移动）")
+    elif idx_dst > idx_src:
+        real = cells[idx_dst - 1]
+        print(f"… 抬起后回填：{a.dst} 会前移到 r{real[1]}c{real[2]}，按那里落")
+        tr, tc = real[1], real[2]
+    elif idx_dst is not None and idx_dst < idx_src:
+        real = cells[idx_dst + 1]
+        print(f"… 起点在目标之后：{a.dst} 不动，落点取 r{real[1]}c{real[2]}（后一位）")
+        tr, tc = real[1], real[2]
+    x1, y1 = src[3], src[4]
+    x2 = d["grid_x"][tc - 1] + a.grab_dx
+    y2 = d["grid_y"][tr - 1] + a.grab_dy
+    print(f"… 拖 “{src[0]}” r{src[1]}c{src[2]} → 落点 r{tr}c{tc} ({x2},{y2})")
+    pre = len(cells)
+    ok = _drag_a11y_jitter(x1, y1, x2, y2, a.hold, a.pick, a.speed)
+    time.sleep(1.0)
+    post = []
+    for _ in range(3):                       # 预热后图标只会暴露很短时间，多读几次取最多的那次
+        _warm_desktop()
+        cur = _icons_normal()[0]
+        if len(cur) > len(post):
+            post = cur
+        if len(post) >= pre - 1:
+            break
+        time.sleep(0.6)
+    names_after = [c[0] for c in _order_cells(post)]
+    if len(post) == pre - 1 and src[0] not in names_after:
+        print(f"✔ 已并入 r{tr}c{tc}：页面 {pre} → {len(post)} 项，被拖图标已不在桌面（手势 {'ok' if ok else '注入未确认'}）")
+        return
+    left = f"仍在 r{_cell(*next((c for c in _order_cells(post) if c[0] == src[0]), (0,0,0,0))[3:5])}" if src[0] in names_after else "已不在桌面"
+    print(f"✘ 没并进去：“{src[0]}” {left}；页面 {pre} → {len(post)} 项")
+    print("  下一次先看 scr look 的实际情况再决定，别直接重跑")
+    sys.exit(1)
+
+def cmd_drag(a):
+    """把 (x1,y1) 的图标长按拖到 (x2,y2)，拖完给结论。
+
+    backend=auto：先 shizuku（唯一能把"按下-停住-拖动-抬起"一次做完的通道），
+    不行再退 a11y 抖动（HyperOS 3 上多半不通，见 SKILL.md 的实测结论）。
+    """
+    if a.on_desktop:
+        pkg0 = info().get("packageName", "")
+        if pkg0 != dev()["launcher"]:
+            print(f"✘ 前台是 {pkg0}，不是桌面（{dev()['launcher']}）：手势会打到 App 上，"
+                  "先把手机停在桌面/别在操作时用手机")
+            sys.exit(3)
+    W, H = screen_size()
+    x1, y1, x2, y2 = int(a.x1), int(a.y1), int(a.x2), int(a.y2)
+    if a.scale and a.scale != 1:                 # 允许直接给截图坐标
+        x1, y1, x2, y2 = [int(v * a.scale) for v in (x1, y1, x2, y2)]
+    if y1 < H * TOP_DEAD and y2 > y1 and not a.force:
+        print(f"✘ 起点 y={y1} 在顶部死区（<{int(H*TOP_DEAD)}）：下滑会被下拉通知/搜索吃掉，"
+              "换一行图标，或先把页面往上滑")
+        sys.exit(3)
+    pre_page = _page_of(raw_nodes())[0]        # 桌面才有页码，用来识别"没拿起变成翻页"
+    pre_sig = _dump_sig()
+    pre_shot = None
+    if pre_sig is None:
+        pre_shot, _e = shot()
+    used, ok, detail = None, False, ""
+    if a.backend in ("auto", "shizuku"):
+        r = subprocess.run(["android-shizuku-cli", "exec",
+                            f"input draganddrop {x1} {y1} {x2} {y2} {a.ms}"],
+                           capture_output=True, text=True)
+        ok = r.returncode == 0 and '"ok":true' in (r.stdout or "")
+        used, detail = "shizuku", (r.stdout or r.stderr).strip()[:120]
+        if not ok and a.backend == "auto":
+            print(f"… shizuku 不可用：{detail}")
+    if not ok and a.backend in ("auto", "a11y"):
+        cont = _drag_a11y_continue(x1, y1, x2, y2, a.ms)
+        if cont:
+            ok, used, detail = True, "a11y-continue", "continueStroke：手指不抬起"
+        else:
+            if cont is None:
+                print("… CLI 不支持 --continue（continueStroke），退回抖动法")
+            ok = _drag_a11y_jitter(x1, y1, x2, y2, a.hold, a.pick, a.speed)
+            used, detail = "a11y-jitter", ""
+    time.sleep(0.8)
+    if pre_sig is not None:                      # 有节点：按结构比，最硬
+        post = _dump_sig()
+        changed = post is not None and post != pre_sig
+        basis = "节点结构"
+    else:                                        # 桌面没图标节点，只能看像素
+        post_shot, _e = shot()
+        d = diff(post_shot, pre_shot) if (post_shot and pre_shot) else None
+        changed = d is not None and d > 0.5      # 0.5%：搬一个图标实测 1–8%，动画/模糊也能到 0.1%
+        basis = f"像素差 {d}%" if d is not None else "像素差取不到"
+    post_page = _page_of(raw_nodes())[0]
+    flipped = bool(pre_page and post_page and pre_page != post_page)
+    if flipped:                                # 拿起失败时，剩下的位移被桌面当成翻页
+        print(f"✘ 没拿起，变成了翻页：桌面 {pre_page} → {post_page} 页（via {used}）")
+        print("  下一步：先把桌面翻回去；拖拽见 SKILL.md 的通道限制说明")
+        sys.exit(1)
+    mark = "✔" if changed else "?"
+    print(f"{mark} drag {x1},{y1} → {x2},{y2} via {used} · "
+          f"{'位置变了' if changed else '未确认（不代表没动）'} · 依据 {basis}（耗时 {a.ms}ms）")
+    if not changed:
+        print("  下一步：scr grid 看实际落点；或换 backend=shizuku / 手动")
+        sys.exit(1)
+
+
+def cmd_do(a):
+    """按顺序跑一串动作；中间步骤只留一行结论，最后统一给一屏。任一步失败即停。"""
+    env = dict(os.environ, SCR_QUIET="1")
+    for step in a.steps:
+        verb, _, arg = step.partition(":")
+        argv = [sys.executable, os.path.abspath(__file__), verb] + ([arg] if arg else [])
+        print(f"── {step}")
+        r = subprocess.run(argv, capture_output=True, text=True, env=env)
+        sys.stdout.write(r.stdout or r.stderr)
+        if r.returncode != 0:
+            print(f"✘ 停在 “{step}”，下面是现在的屏幕：")
+            sys.exit(r.returncode)
+        time.sleep(0.1)
+    cmd_look(argparse.Namespace(shot=False))
+
+
+def cmd_doctor(a):
+    """换机 / 授权变动后跑这一条：逐项体检，--save 把测到的常数写进 device.json。
+
+    只读：不点屏幕、不进编辑模式；唯一副作用是截一张图验证通道。
+    检查项按依赖顺序排，第一项过不了后面就都是空的。
+    """
+    rep, rows = {}, []
+    bad = [0]
+
+    def add(k, v, ok=True, hint=""):
+        rep[k] = v
+        rows.append((k, v, ok, hint))
+        if not ok:
+            bad[0] += 1
+
+    def out():
+        if a.json:
+            print(json.dumps({"ok": bad[0] == 0, "items": rep}, ensure_ascii=False))
+            return
+        for k, v, ok, hint in rows:
+            print(f"{'✅' if ok else '❌'} {k:<12} {v}")
+            if hint and not ok:
+                print(f"{'':<15}→ {hint}")
+        print("✅ 全部通过" if bad[0] == 0 else f"❌ {bad[0]} 项不通过")
+        if bad[0]:
+            print("下一步：先修上面第一条 ❌，后面的项都依赖它。")
+
+    # 1) 读屏通道——这是所有检查的前提
+    d0 = a11y("ui", "dump")
+    if not d0.get("ok"):
+        e = d0.get("error") or {}
+        add("读屏通道", f"✘ {e.get('code')} {str(e.get('message'))[:60]}", False,
+            "Settings → Permissions → Integrations：android-a11y-cli 设为 Allow")
+        out()
+        sys.exit(2)
+
+    nodes = d0["data"]["nodes"]
+    info_ = info()
+    pkg = info_.get("packageName", "")
+    st = a11y("service", "status").get("data") or {}
+    add("无障碍服务", f"state={st.get('state')} caps={','.join(st.get('capabilities') or [])}",
+        st.get("state") == "ON", "设置→无障碍 里把 Minis 重新打开；HyperOS 会自己把它关掉")
+
+    model = {}
+    try:
+        model = json.loads(subprocess.run(["android-device", "info"], capture_output=True,
+                                          text=True).stdout)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+    # 2) 屏幕与状态栏/导航条
+    H = max([n["bounds"]["bottom"] for n in nodes] + [0])
+    W = max([n["bounds"]["right"] for n in nodes] + [0])
+    d = dev()
+    # 屏幕尺寸以截图元数据为准：前台是悬浮窗/分屏时，"最大节点"只是那个窗口的尺寸。
+    sw = sh_ = None
+    try:
+        meta = a11y("ui", "screenshot", "--format", "jpeg")
+        if meta.get("ok"):
+            sw, sh_ = meta["data"].get("originalWidth"), meta["data"].get("originalHeight")
+    except Exception:                                          # noqa: BLE001
+        pass
+    W, H = (sw, sh_) if (sw and sh_) else (W, H)
+    add("屏幕", f"{W}×{H}" + ("" if (W, H) == (d["w"], d["h"]) else f"（档案里是 {d['w']}×{d['h']}，需更新）"),
+        (W, H) == (d["w"], d["h"]), "scr doctor --save 会把实测值写进 device.json")
+    add("机型", f"{model.get('manufacturer','?')} {model.get('model','?')} / Android {model.get('android_version','?')}")
+
+    roots = [n for n in nodes if n["depth"] == 0]
+    add("窗口根数", f"{len(roots)} 根 · " + ",".join(sorted({(n.get("packageName") or "?") for n in roots})[:4]),
+        len(roots) >= 1)
+    field = sum(1 for n in nodes if n.get("packageName"))
+    add("节点含包名", f"{field}/{len(nodes)}", field > 0,
+        "若为 0 说明这版 CLI 不返回 packageName，包名只能靠 ui info")
+
+    # 3) 清单与像素模式判据
+    items = build(nodes)
+    raw_click = [n for n in nodes if n["clickable"] or n["editable"] or n["checkable"]]
+    ids = {n["nodeId"] for _, n in items}
+    # 只拿"有标签的可点节点"比：无标签的可点节点（桌面上就是文件夹格子、整屏容器、
+    # 状态栏芯片）本来就不该进清单——按全部可点节点算会永远误报，把体检结论带偏。
+    W_, H_ = _scrn()
+    named = [n for n in raw_click
+             if lbl(n) and not PAGE_RE.search(lbl(n))
+             and (n["bounds"]["right"] - n["bounds"]["left"]) *
+                 (n["bounds"]["bottom"] - n["bounds"]["top"]) < 0.4 * W_ * H_]
+    miss = [n for n in named if n["nodeId"] not in ids]
+    add("清单/原始", f"清单 {len(items)} 项 · 有标签可点 {len(named)} 个 · 漏掉 {len(miss)}"
+        + (f"（含 {len(raw_click) - len(named)} 个无标签可点节点，桌面文件夹/容器属正常）"
+           if len(raw_click) > len(named) else ""),
+        len(miss) <= max(2, len(named) // 3),
+        "漏太多说明 build() 过滤过狠（小图标 <4000px²、超大容器、被外壳吞掉的子控件）")
+    add("像素模式", f"当前屏会判定：{'是（会截图）' if len(items) < 3 else '否'}",
+        not (len(items) >= 3 and len(raw_click) < 3),
+        "清单 <3 但其实有可点节点 = 假像素模式，白花一次截图")
+
+    # 4) 桌面
+    if pkg == d["launcher"]:
+        add("桌面节点", f"普通态 {len(items)} 项（HyperOS 通常为 0，靠 grid/截图）", True)
+
+    # 5) 截图通道（系统弹窗/权限框在上面时 takeScreenshot 会失败，隔 0.6s 再试一次再判死）
+    t0 = time.time()
+    path, err = shot()
+    if not path:
+        time.sleep(0.6)
+        path, err = shot()
+    ms = int((time.time() - t0) * 1000)
+    if path:
+        try:
+            from PIL import Image
+            vw, vh = Image.open(path).size
+        except Exception:                                      # noqa: BLE001
+            vw, vh = 0, 0
+        # 档案里的 scale 是"看图/屏幕"的比例（0.5=半尺寸），xy 的 --scale 是它的倒数
+        ratio = round(vw / W, 3) if W else 0
+        add("截图通道", f"{ms}ms · 看图 {vw}×{vh} · 看图/屏幕 = {ratio}"
+            + ("" if ratio == d["scale"] else f"（档案是 {d['scale']}，需更新）"), ratio > 0)
+    elif err == "SECURE":
+        add("截图通道", f"{ms}ms · 当前窗口禁止截屏（受保护窗口，属正常）", True)
+    else:
+        add("截图通道", f"{ms}ms · ✘ {err}", False, "无障碍 takeScreenshot 不可用时会退回通知栏磁贴")
+
+    if a.save:
+        nd = dict(d)
+        nd.update({"w": W, "h": H, "launcher": pkg if pkg == d["launcher"] else d["launcher"],
+                   "android": str(model.get("android_version", "")),
+                   "model": str(model.get("model", "")), "save_at": int(time.time())})
+        save_dev(nd)
+        add("device.json", DEVFILE, True)
+    out()
+    if bad[0]:
+        sys.exit(1)
+
+
+# ---------- 入口 ----------
+def require_service():
+    """开跑前先确认无障碍在跑。掉线时每条命令都要白试十几秒才报错，
+    而且失败原因会被误读成"App 没装/图标找不到"——这里一次性说清楚。"""
+    try:
+        p = subprocess.run(["android-a11y-cli", "service", "ping"],
+                           capture_output=True, text=True, timeout=8)
+        out = ((p.stdout or "") + (p.stderr or "")).strip()
+    except Exception as e:                                     # noqa: BLE001
+        out = f"{type(e).__name__}: {e}"
+    if "running" not in out.lower():
+        print(f"✘ 无障碍服务不在运行：{out[:140]}")
+        print("  去 设置→无障碍→Minis 打开（用户自己操作手机时会关掉它，这属于预期）")
+        sys.exit(69)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="scr", add_help=True)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("look"); p.add_argument("--shot", action="store_true")
+    p.set_defaults(f=cmd_look)
+
+    p = sub.add_parser("tap")
+    p.add_argument("target"); p.add_argument("--nth", type=int, default=None)
+    p.add_argument("--expect", default=""); p.add_argument("--timeout", type=int, default=1500)
+    p.set_defaults(f=cmd_tap)
+
+    p = sub.add_parser("xy")
+    p.add_argument("x"); p.add_argument("y")
+    p.add_argument("--scale", type=float, default=1)
+    p.add_argument("--verify", action="store_true"); p.add_argument("--timeout", type=int, default=1500)
+    p.set_defaults(f=cmd_xy)
+
+    p = sub.add_parser("type")
+    p.add_argument("text"); p.add_argument("--into", default=None)
+    p.set_defaults(f=cmd_type)
+
+    p = sub.add_parser("key")
+    p.add_argument("name"); p.add_argument("--timeout", type=int, default=1500)
+    p.set_defaults(f=cmd_key)
+
+    p = sub.add_parser("swipe")
+    p.add_argument("dir", choices=["up", "down", "left", "right"])
+    p.add_argument("--dist", type=int, default=800)
+    p.set_defaults(f=cmd_swipe)
+
+    p = sub.add_parser("open"); p.add_argument("target"); p.set_defaults(f=cmd_open)
+
+    p = sub.add_parser("wait")
+    p.add_argument("target"); p.add_argument("--timeout", type=int, default=4000)
+    p.add_argument("--gone", action="store_true"); p.set_defaults(f=cmd_wait)
+
+    p = sub.add_parser("state"); p.set_defaults(f=cmd_state)
+    p = sub.add_parser("shot"); p.add_argument("--full", action="store_true"); p.set_defaults(f=cmd_shot)
+
+    p = sub.add_parser("grid")
+    p.add_argument("--json", default=None, help="把整份布局写到这个文件")
+    p.add_argument("--pages", type=int, default=None, help="页数读不到时用这个值")
+    p.set_defaults(f=cmd_grid)
+
+    p = sub.add_parser("drag-into", help="拖进文件夹/格子（落点按抬起后布局补偿）")
+    p.add_argument("src", help="被拖图标的名字")
+    p.add_argument("dst", help="目标格子，如 r3c1")
+    p.add_argument("--shift", action="store_true", help="启用回填补偿（默认关闭，实测不需要）")
+    p.add_argument("--grab-dx", type=int, default=0, help="落点 x 修正（图标中心 vs 指尖）")
+    p.add_argument("--grab-dy", type=int, default=0, help="落点 y 修正")
+    p.add_argument("--hold", type=int, default=1500)
+    p.add_argument("--pick", type=int, default=420)
+    p.add_argument("--speed", type=int, default=300, help="移动速度，默认 300（500 易被判甩动→插入）")
+    p.set_defaults(f=cmd_drag_into)
+
+    p = sub.add_parser("drag")
+    p.add_argument("x1"); p.add_argument("y1"); p.add_argument("x2"); p.add_argument("y2")
+    p.add_argument("--hold", type=int, default=3500, help="落点悬停毫秒数，默认 3500（<1s 实测判失败，要够久才出合并预览）")
+    p.add_argument("--pick", type=int, default=420, help="拿起时长毫秒数，默认 420（>500 变长按弹菜单）")
+    p.add_argument("--speed", type=int, default=300, help="移动速度 px/s，默认 300（500 判甩动→插入）")
+    p.add_argument("--scale", type=float, default=1, help="给的是截图坐标就写 2")
+    p.add_argument("--ms", type=int, default=800, help="按住到落下的总时长")
+    p.add_argument("--backend", choices=["auto", "shizuku", "a11y"], default="auto")
+    p.add_argument("--force", action="store_true", help="允许从顶部死区起手（长按抢得过系统手势时）")
+    p.add_argument("--on-desktop", dest="on_desktop", action="store_true",
+                   help="先断言前台是桌面，否则拒绝执行（防止手势打到别的 App 上）")
+    p.set_defaults(f=cmd_drag)
+
+    p = sub.add_parser("doctor")
+    p.add_argument("--save", action="store_true"); p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_doctor)
+
+    p = sub.add_parser("do"); p.add_argument("steps", nargs="+"); p.set_defaults(f=cmd_do)
+
+    a = ap.parse_args()
+
+    # 解析完再预检：--help 不该被无障碍状态挡住；doctor 的职责恰恰是诊断掉线，不能先拦。
+    if getattr(a, "cmd", None) and a.cmd != "doctor":
+        require_service()
+    if not getattr(a, "f", None):
+        ap.print_help()
+        return
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()

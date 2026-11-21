@@ -1,0 +1,1759 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""bw — 接管本机的 X 浏览器（com.mmbox.xbrowser）。
+
+根本目的（用户原话，不得改写）：
+    目的：让 AI 快速高效的用用户手机上那个浏览器，并且当我提出拟人化操作是，
+    可以更拟人化使用浏览器。（并且用完最好能把没用的界面关闭）
+
+由此推出的三条实现约束（作者的推论，可以改）：
+- 登录态在他自己的浏览器里，所以不能换成别的容器；
+- 默认求快，拟人是显式开关（--human / 粘性状态）；
+- 收尾只关自己开的标签，不碰用户的。
+
+三条契约（所有命令都遵守）：
+  1. 第一行就是结论；失败前一定 render 一次屏幕（失败不给屏 = 模型多花一轮）。
+  2. 效果不确定用 exit 3（没变化/没打开/没关成），硬失败 exit 2，成功 0 —— 所以 && 链会自己停。
+  3. 每个动作都要自证：变了没、标题是什么、来源是哪；不许打没验证过的 ✔。
+
+设计取舍（改之前先读）：
+- 不用插件、不装桥、不碰 WebView 调试口，只走无障碍节点 + 系统截屏，所以和 App 版本无关。
+- 导航优先用 intent（40ms 到达），只为自己开的标签记账；地址栏输入是退路。
+- 节点是主通道，节点薄的站点（知乎/重 JS）才截图交给模型看，截图很贵。
+- 所有"点/写"都必须在同一次 dump 之后立刻做：nodeId 每 dump 一次全变。
+
+用法见 SKILL.md。这里是实现。
+"""
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+
+_T0 = time.time()          # 进程起点：全程计时从这儿算，含 front()/dump() 与模块导入之后的一切
+
+PKG = "com.mmbox.xbrowser"
+# 屏幕尺寸不再写死：第一帧 dump 里实测根节点（本机 1280x2772，旧机 1080x2400）。
+W, H = 1080, 2400
+_GEOM = {"done": False}
+# 账本必须是**跨会话**的：浏览器标签是全局的，账本放在某个会话的 workspace 里，
+# 另一个会话跑 close 就会看不见这些标签、永远关不掉（2026-11-22 复查发现）。
+STATE = "/var/minis/shared/bw/session.json"
+_OLD_STATE = "/var/minis/workspace/bw/session.json"
+HUMAN = (os.environ.get("BW_HUMAN", "").strip().lower() in ("1", "true", "on", "yes"))
+
+# ---------- 设备 ----------
+def a11y(*args, t=20):
+    try:
+        p = subprocess.run(["android-a11y-cli", *args],
+                           capture_output=True, text=True, timeout=t)
+        out = p.stdout.strip()
+        if out.startswith("{"):
+            return json.loads(out)
+        return {"ok": False, "error": {"code": "NO_JSON", "message": (out + p.stderr)[:200]}}
+    except Exception as e:                                    # noqa: BLE001
+        return {"ok": False, "error": {"code": "EXC", "message": str(e)[:160]}}
+
+_IN_DIE = [False]
+
+def _proc_age_ms():
+    """进程真实年龄（毫秒），含解释器启动。
+    只用 time.time() 会漏掉 exec/import 的几百毫秒（本机实测 ~380ms），自报就比用户实测小一截。
+    /proc/uptime 在 PRoot 里不可读，改用 CLOCK_BOOTTIME（与 stat 的 starttime 同一时间基）。"""
+    try:
+        fld = open("/proc/self/stat").read().rsplit(") ", 1)[1].split()
+        start = float(fld[19]) / os.sysconf("SC_CLK_TCK")
+        return int((time.clock_gettime(time.CLOCK_BOOTTIME) - start) * 1000)
+    except Exception:                                          # noqa: BLE001
+        return int((time.time() - _T0) * 1000)
+
+
+def die(msg, hint="", code=2):
+    """报错并回一屏——失败时不给屏幕，模型就得再花一轮才知道发生了什么。"""
+    print(f"✘ {msg}" + (f"\n  {hint}" if hint else ""))
+    if not _IN_DIE[0]:
+        _IN_DIE[0] = True
+        try:
+            if front() == PKG:
+                print(render(dump(), maxc=800))
+        except SystemExit:
+            pass
+        except Exception:                                      # noqa: BLE001
+            pass
+    sys.exit(code)
+
+def dump():
+    d = a11y("ui", "dump")
+    if not d.get("ok"):
+        e = d.get("error") or {}
+        if e.get("code") == "SERVICE_NOT_RUNNING":
+            die("无障碍没开", "让用户去 设置→无障碍 打开 Minis")
+        die(f"dump 失败 {e.get('code')} {e.get('message','')}")
+    nodes = d["data"]["nodes"]
+    _measure(nodes)
+    return nodes
+
+def _measure(nodes):
+    """第一帧实测屏幕几何；换机不用改常量。
+    判据：根节点 bounds 最大值＝屏幕右下；工具栏上沿＝包内最靠下的可点节点 top（占比 >0.85）；
+    地址栏下沿＝顶部宽条（宽 >0.55W、高 90–190、top <0.25H）的 bottom，找不到就按 0.1H。"""
+    global W, H, TOP, BOTTOM
+    if _GEOM["done"]:
+        return
+    right = bottom = 0
+    for n in nodes:
+        b = n.get("bounds") or {}
+        right = max(right, b.get("right", 0))
+        bottom = max(bottom, b.get("bottom", 0))
+    if right > 400 and bottom > 800:
+        W, H = right, bottom
+    tb = [b.get("top", 0) for n in nodes
+          if n.get("packageName") == PKG and n.get("clickable")
+          for b in [n.get("bounds") or {}] if b.get("top", 0) > 0.85 * H]
+    BOTTOM = min(tb) if tb else int(0.93 * H)
+    ab = [b.get("bottom", 0) for n in nodes
+          if n.get("packageName") == PKG and n.get("clickable")
+          for b in [n.get("bounds") or {}]
+          if b.get("right", 0) - b.get("left", 0) > 0.55 * W
+          and 90 <= b.get("bottom", 0) - b.get("top", 0) <= 190 and b.get("top", 9e9) < 0.25 * H]
+    TOP = min(ab) if ab else int(0.10 * H)
+    _GEOM["done"] = True
+
+def _open(args, t=15):
+    """android-open 一律带超时：熄屏或系统卡住时它会挂住，调用方等不到任何返回。"""
+    try:
+        return subprocess.run(["android-open", *args], capture_output=True, text=True, timeout=t)
+    except Exception:
+        return None
+
+def front():
+    d = a11y("ui", "info")
+    return (d.get("data") or {}).get("packageName", "?")
+
+# ---------- 页面读取 ----------
+# 由 _measure() 首次 dump 时实测：本机 1280x2772 → TOP=295 / BOTTOM=2574；旧机 1080x2400 → 240 / 2255
+BOTTOM = 2255          # 底部工具栏上沿
+TOP = 240              # 地址栏下沿
+# 页面外壳（导航条/工具栏/翻译提示）不算正文，读的时候剔掉
+CHROME = re.compile(r"^(Translate this result|网站设置|广告|关闭|跳转|下载|打开 ?App|打开APP|"
+                    r"Sign in|Skip to content|Accessibility Feedback|Back to .* search|"
+                    r"国内版|国际版|Search Filter|ALL|IMAGES|WEB|VIDEOS|Global web icon|"
+                    r"Turn off Hover Translation.*|Search|Images|Videos|More|"
+                    r"Account Rewards and Preferences|Microsoft Rewards|Settings and quick links)$")
+
+def web_nodes(nodes):
+    """只要网页正文区里的节点，工具栏/状态栏/通知栏一律剔除。"""
+    out = []
+    for n in nodes:
+        b = n.get("bounds") or {}
+        if n.get("packageName") != PKG:
+            continue
+        if b.get("top", 0) < TOP or b.get("bottom", 0) > BOTTOM:
+            continue
+        out.append(n)
+    return out
+
+def label(n):
+    t = (n.get("text") or "").strip()
+    if not t:
+        t = (n.get("contentDesc") or "").strip()
+    return re.sub(r"\s+", " ", t)
+
+def page_items(nodes):
+    """(y, x, text, node) 按阅读顺序；同位置的重复文本只留一份。"""
+    seen, items = set(), []
+    for n in web_nodes(nodes):
+        t = re.sub(r"\s*Translate this result$", "", label(n))
+        if not t or CHROME.match(t):
+            continue
+        b = n["bounds"]
+        k = (t, b["top"] // 6)
+        if k in seen:
+            continue
+        seen.add(k)
+        items.append((b["top"], b["left"], t, n))
+    items.sort(key=lambda x: (x[0] // 8, x[1]))
+    return items
+
+def bar_text(nodes):
+    """地址栏里的那行字：正常时是页面标题，编辑态里是 URL。"""
+    cand = [n for n in nodes if n.get("packageName") == PKG
+            and (n.get("bounds") or {}).get("top", 999) < 230
+            and (n.get("text") or "").strip()]
+    return label(cand[0])[:80] if cand else ""
+
+def text_of(nodes, maxc):
+    out, size = [], 0
+    for _y, _x, t, _n in page_items(nodes):
+        out.append(t)
+        size += len(t)
+        if size >= maxc:
+            break
+    return "\n".join(out)
+
+def sig(nodes):
+    items = page_items(nodes)
+    return (bar_text(nodes), len(items), "|".join(t for _y, _x, t, _n in items[:12]))
+
+def patience(nodes, tries=2):
+    """页面还在长：字少就再等两口气，别把空壳交出去。"""
+    for _ in range(tries):
+        if len(text_of(nodes, 10 ** 6)) >= 80:
+            break
+        time.sleep(0.9)
+        nodes = dump()
+    return nodes
+
+def settle(prev, timeout=6000, need_chars=300):
+    """等页面停住：签名变了、连续两次一样、而且不是"还在转圈"的空壳。
+    空壳页（只有导航条文字）继续等到超时——早一回合交给模型，就得再跑一回合。"""
+    t0 = time.time()
+    last, changed, stable = None, False, 0
+    while True:
+        nodes = dump()
+        s = sig(nodes)
+        chars = len(text_of(nodes, 10 ** 6))
+        if prev is None:
+            changed = chars >= need_chars        # 没基准：有正文就算变了
+        elif s != prev:
+            changed = True
+        stable = stable + 1 if s == last else 0
+        last = s
+        el = (time.time() - t0) * 1000
+        if changed and stable >= 1 and el >= 450 and (chars >= need_chars or (el > 4200 and chars >= 80)):
+            return nodes, True, int(el)
+        if el > timeout:
+            return nodes, changed, int(el)
+        time.sleep(0.14 if HUMAN else 0.1)
+
+INTERCEPT = re.compile(r"(验证码|滑块|安全验证|人机验证|环境异常|访问异常|访问受限|"
+                       r"操作频繁|请在微信|页面不存在|内容不存在|已被删除)")
+
+def flag(nodes):
+    """这一屏能不能信：拦截页 / 登录墙 / 空壳，三种都是"别接着往下做"的信号。"""
+    txt = text_of(nodes, 4000)
+    m = INTERCEPT.search(txt)
+    if m:
+        return f"⛔ 拦截页「{m.group(1)}」——正文不是真内容，要人介入"
+    wall = re.search(r"(登录后查看|登录后阅读|扫码登录|请先登录|请登录|登录即可|未登录|"
+                     r"登录/注册|登录注册|Sign in to continue|Log in to continue)", txt)
+    if (wall or re.search(r"(登录|Verify|Just a moment)", bar_text(nodes))) and len(txt) < 400:
+        return "⛔ 像是登录墙——X 浏览器里的会话没登进去，需要你在手机上登一次"
+    if "文件下载" in txt and "取消" in txt:
+        return "⚠ 这是下载弹窗，不是网页——点“取消”退回去，别让文件落盘"
+    if txt.strip().startswith("{") and re.search(r'"code"\s*:', txt):
+        return "⚠ 这页是接口返回的 JSON（不是正文），多半是参数被站点拒了"
+    if not txt.strip():
+        return "⚠ 0 字：整屏被裁（PDF/canvas）或还没渲染，用 bw shot 看一眼"
+    return ""
+
+BRIEF = [False]
+
+def render(nodes, maxc=2500, head=0, force=False):
+    items = page_items(nodes)
+    txt = text_of(nodes, maxc)
+    warn = flag(nodes)
+    head_line = f"《{bar_text(nodes) or '?'}》 {len(items)} 块 / {len(txt)} 字"
+    if BRIEF[0] and not force:          # 链式执行：中间步只留一行
+        return "\n".join(([warn] if warn else []) + [head_line])
+    lines = ([warn] if warn else []) + [head_line]
+    if head:
+        txt = "\n".join(txt.splitlines()[:head])
+    return "\n".join(lines + [txt]) if txt else "\n".join(lines + ["（这一屏读不到文字——用 bw shot 看图）"])
+
+# ---------- 拟人 ----------
+def nap(lo=0.18, hi=0.45, scale=1.0):
+    if HUMAN:
+        time.sleep(random.uniform(lo * 3, hi * 3) * scale)
+
+def jitter_point(b, pad=0.28):
+    """点控件内部偏一点，别总是正中靶心。"""
+    w = max(1, b["right"] - b["left"])
+    h = max(1, b["bottom"] - b["top"])
+    if not HUMAN:
+        return (b["left"] + b["right"]) // 2, (b["top"] + b["bottom"]) // 2
+    x = int(b["left"] + w * random.uniform(pad, 1 - pad))
+    y = int(b["top"] + h * random.uniform(pad, 1 - pad))
+    return x, y
+
+def tap_node(n):
+    """点一个节点。拟人模式下只许真实触摸（tap xy）：
+    ACTION_CLICK 不产生触摸事件，页面能看出"没人碰过就被点了"；而且失败时会静默成功。
+    宁可报错让调用方知道，也不要用注入点击伪装成人手。"""
+    b = n["bounds"]
+    if HUMAN:
+        for _ in range(2):                     # 抖动点偏了再取一次，不无限重试
+            x, y = jitter_point(b)
+            if a11y("tap", "xy", str(x), str(y)).get("ok"):
+                return "xy"
+            nap(0.1, 0.3)
+        return "fail"
+    r = a11y("tap", "node", n["nodeId"])
+    if r.get("ok"):
+        return "node"
+    x, y = jitter_point(b)
+    return "xy" if a11y("tap", "xy", str(x), str(y)).get("ok") else "fail"
+
+def swipe_up(dist=None, dur=None):
+    """往上滑（看下面的内容）。人手不会每次都同一条直线、同一个速度。"""
+    if HUMAN:
+        d = dist or random.randint(int(H * 0.42), int(H * 0.68))
+        dur = dur or random.randint(260, 620)
+        x = random.randint(W // 4, W * 3 // 4)
+        drift = random.randint(-40, 40)
+        a11y("gesture", "swipe", str(x), str(1200 + d // 2),
+             str(x + drift), str(1200 - d // 2), "--duration", str(dur))
+    else:
+        d = dist or 900
+        a11y("gesture", "swipe", "540", str(1200 + d // 2), "540", str(1200 - d // 2),
+             "--duration", "320")
+
+def swipe_down(dist=None):
+    if HUMAN:
+        d = dist or random.randint(int(H * 0.35), int(H * 0.6))
+        x = random.randint(W // 4, W * 3 // 4)
+        a11y("gesture", "swipe", str(x), str(1200 - d // 2),
+             str(x + random.randint(-40, 40)), str(1200 + d // 2),
+             "--duration", str(random.randint(260, 560)))
+    else:
+        d = dist or 900
+        a11y("gesture", "swipe", "540", str(1200 - d // 2), "540", str(1200 + d // 2),
+             "--duration", "320")
+
+# ---------- 标签记账 ----------
+def load_state():
+    """读账本。**坏文件不静默清零**：清零＝开过的标签永远关不掉，是 close 假成功的第二条根因。
+    文件不存在 → 空账（正常）；解析失败 → 改名留证 + 报错退出，让调用方看见。"""
+    if not os.path.exists(STATE) and os.path.exists(_OLD_STATE):
+        try:                                    # 老位置（某会话的 workspace）一次性搬过来
+            os.makedirs(os.path.dirname(STATE), exist_ok=True)
+            os.replace(_OLD_STATE, STATE)
+        except Exception:                       # noqa: BLE001
+            pass
+    if not os.path.exists(STATE):
+        return {"tabs": [], "active": None}
+    try:
+        st = json.load(open(STATE))
+    except Exception as e:                                     # noqa: BLE001
+        bad = f"{STATE}.bad-{int(time.time())}"
+        try:
+            os.replace(STATE, bad)
+        except Exception:                                      # noqa: BLE001
+            bad = "(改名失败)"
+        print(f"✘ 账本损坏（{type(e).__name__}），已另存为 {bad}\n  下一步：bw tabs 看当前账本；需要重记就用 bw go 重新打开页面")
+        sys.exit(2)
+    st.setdefault("tabs", [])
+    st.setdefault("active", None)
+    return st
+
+HUMAN_TTL = 900          # 15 分钟没用就自动失效，别污染下次任务
+
+def save_state(st):
+    """原子写：先写 .tmp 再 replace。
+    半截 JSON 会被 load_state 当成空账，而空账的后果是"开过的标签再也关不掉"——所以这一步不能省。"""
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, ensure_ascii=False)
+    os.replace(tmp, STATE)
+
+def note_tab(title):
+    """记一个"这是我开的标签"。active 指向它，后面它改名了还能认出来。"""
+    st = load_state()
+    # 标题为空也要记：误触底栏"主页"开的空白页，不记账就永远关不掉
+    st["tabs"] = (st["tabs"] + [{"title": title or "", "ts": int(time.time())}])[-20:]
+    st["active"] = len(st["tabs"]) - 1
+    st["last"] = title
+    save_state(st)
+
+def rename_active(title):
+    """复用同一个标签里跳了页：就地改名，而不是再追加一条。
+    追加会在账本里堆出一串同一张卡的旧标题，后面每次 close 都要为它们逐个失败（2026-11-22 实测 1 张卡 4 条记录）。"""
+    st = load_state()
+    if not title:
+        return
+    if st.get("active") is None or not st["tabs"]:
+        return note_tab(title)
+    st["tabs"][st["active"]]["title"] = title
+    st["last"] = title
+    save_state(st)
+
+def retitle_active(nodes):
+    """在这个"我开的"标签里又跳了页：把新标题也记一笔。
+    搜索结果常在新标签里打开，所以宁可按两个标题各关一次，也不漏关。"""
+    st = load_state()
+    title = bar_text(nodes)
+    if st.get("active") is None or not title:
+        return
+    if st["tabs"] and st["tabs"][-1]["title"] == title:
+        return
+    note_tab(title)
+
+def human_set(on, minutes=15):
+    st = load_state()
+    if on:
+        st["human_until"] = int(time.time()) + minutes * 60
+    else:
+        st["human_until"] = 0
+    save_state(st)
+
+def human_left():
+    return max(0, load_state().get("human_until", 0) - int(time.time()))
+
+# ---------- 动作 ----------
+def _url_of(target):
+    if re.match(r"^(https?|file|about):", target):
+        return target
+    if "." in target and " " not in target:
+        return "https://" + target
+    return "https://cn.bing.com/search?q=" + target.replace(" ", "+")
+
+def via_intent(url, wait_ms=6500):
+    # 基准只在"浏览器在前台"时才有意义：Minis 在前台时 dump 到的是 Minis 的屏，
+    # 拿它当 prev 会让"变了/没变"全靠运气（子 agent 2026-11-22 实测）。
+    prev = sig(dump()) if front() == PKG else None
+    _open(["intent:" + url + "#Intent;action=android.intent.action.VIEW;package=" + PKG + ";end"])
+    t0 = time.time()
+    while time.time() - t0 < 4:
+        if front() == PKG:
+            break
+        time.sleep(0.1)
+    nodes, changed, ms = settle(prev, timeout=wait_ms)
+    nodes = patience(nodes)
+    return nodes, ms, changed
+
+MINIS = "com.openminis.app"
+
+def bring_minis_front(timeout=4.0):
+    """把 Minis 自己切回前台，好让 VIEW intent 被系统放行（后台启动会被静默 cancel）。
+    做法：Recents → 点"Minis"那张卡片。recents 的卡片标签形如 `Minis,未加锁`。
+    失败就返回 False，调用方退回"新建标签+地址栏"。
+    2026-11-22 实测：这一步能成功，随后 intent 697ms 落地。"""
+    if front() == MINIS:
+        return True
+    if os.environ.get("BW_NO_FRONT", "").strip() == "1":
+        return False
+    try:
+        if not a11y("input", "key", "recents").get("ok"):
+            return False
+    except Exception:                                            # noqa: BLE001
+        return False
+    card = None
+    t0 = time.time()
+    while time.time() - t0 < 2.5:
+        time.sleep(0.4)
+        for n in dump():
+            lab = label(n)
+            b = n.get("bounds") or {}
+            # 只要大卡片：状态栏那颗"Minis:0:12"也含 Minis，但很小
+            if "Minis" in lab and (b.get("right", 0) - b.get("left", 0)) > 0.3 * W \
+                    and (b.get("bottom", 0) - b.get("top", 0)) > 0.3 * H:
+                card = n
+                break
+        if card:
+            break
+    if not card:
+        return False
+    b = card["bounds"]
+    a11y("tap", "xy", str((b["left"] + b["right"]) // 2), str((b["top"] + b["bottom"]) // 2))
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if front() == MINIS:
+            return True
+        time.sleep(0.2)
+    return False
+
+def addr_bar(nodes):
+    """找地址栏（首页是居中的搜索框，页面内是顶部条）：宽 >0.55W、高 90–190、top <0.6H、
+    且左右各有留白（列表行是全宽，靠这条区分）的最宽可点节点。
+    返回点击中心 (x,y)；找不到返回 None。换机/换布局都不该写死坐标。"""
+    best = None
+    for n in nodes:
+        b = n.get("bounds") or {}
+        if n.get("packageName") != PKG or not n.get("clickable"):
+            continue
+        w = b.get("right", 0) - b.get("left", 0)
+        h = b.get("bottom", 0) - b.get("top", 0)
+        if w < 0.55 * W or not (90 <= h <= 190) or b.get("top", 9e9) > 0.6 * H:
+            continue
+        if b.get("left", 0) < 0.02 * W or b.get("right", 0) > 0.98 * W:   # 全宽＝列表行，不是地址栏
+            continue
+        if best is None or w > best[0]:
+            best = (w, ((b["left"] + b["right"]) // 2, (b["top"] + b["bottom"]) // 2))
+    return best[1] if best else None
+
+def _bar_cleanup():
+    """地址栏没走通后的收尾：把浮层/键盘收起来。
+    不收的后果（2026-11-22 实测）：下一次 go 看到地址栏里还留着我们打的 URL，
+    判成"地址栏已是目标域名"→ 假成功；而且面板点不开（点到了联想词列表）。"""
+    try:
+        a11y("input", "key", "back")
+        time.sleep(0.4)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+def via_bar(url):
+    """在当前标签里改地址（不留新标签）。慢一点，但不会堆出一堆页。"""
+    prev = sig(dump())
+    spot = addr_bar(dump())
+    if not spot:
+        return None, 0
+    a11y("tap", "xy", str(spot[0]), str(spot[1]))
+    ed = None
+    t0 = time.time()
+    while time.time() - t0 < 2500:
+        nodes = dump()
+        ed = [n for n in nodes if n.get("editable") and n.get("packageName") == PKG]
+        if ed:
+            break
+        time.sleep(0.12)
+    if not ed:
+        _bar_cleanup()                   # 点了地址栏却没出输入框：也要退回去
+        return None, 0
+    if not a11y("input", "text", url, "--node", ed[0]["nodeId"]).get("ok"):
+        _bar_cleanup()
+        return None, 0
+    nodes = dump()
+    prev_title = prev[0] if isinstance(prev, tuple) else ""   # 打字前的页面标题
+    if ime_up(nodes):                     # 地址栏的“前往”就是键盘右下角那颗
+        # 三条路依次试：键盘 H-186（本机 Sogou）→ 地址栏右侧的“前往”箭头 → 键盘 H-100（旧机）。
+        # 本机顶部地址栏在某些布局下打完字键盘会自己收起，这时只能点箭头（2026-11-22 实测）。
+        for act in ("enter186", "arrow", "enter100"):
+            if act == "arrow":
+                if ime_up():
+                    a11y("input", "key", "back")      # 先收键盘，箭头才露出来
+                    time.sleep(0.3)
+                a11y("tap", "xy", str(int(W * 0.9375)), str(spot[1]))
+            elif act == "enter186":
+                if not press_ime_enter(H - 186):
+                    continue
+            else:
+                if not press_ime_enter(H - 100):
+                    continue
+            # 落地判据要三条一起满足：键盘收起、标题变了、页面内容真的变了。
+            # 只查"标题非空"会把"地址栏里还留着旧标题"当成打开成功（2026-11-22 实测 1490ms 假成功）。
+            # 落地判据：键盘收起 + 地址栏不再显示"我刚打的字"。
+            # 不能用"标题变了"：同站不同页常常同名（example.com / example.org 都叫 Example Domain），
+            # 也不能只看"内容变了"：内容可能一模一样（2026-11-22 实测两次假失败/一次假成功）。
+            t1 = time.time()
+            landed = False
+            while time.time() - t1 < 6:
+                time.sleep(0.3)
+                nn = dump()
+                bt = bar_text(nn)
+                typed = {url.strip(), url.strip() + "/"}
+                if not ime_up(nn) and bt and bt not in typed \
+                        and bt not in ("新标签页", "主页", "搜索或网址"):
+                    landed = True
+                    break
+            if landed:
+                nodes, _changed, ms = settle(prev, timeout=4000)
+                return nodes, ms
+        _bar_cleanup()                   # 键盘还在、页面没跳：收起来再交给调用方
+        return None, ms
+    btn = [n for n in nodes if n.get("packageName") == PKG and n.get("clickable")
+           and (n.get("bounds") or {}).get("top", 999) < TOP - 5
+           and 800 <= (n.get("bounds") or {}).get("left", 0) <= 950]
+    if not btn:
+        a11y("input", "key", "back")
+        return None, 0
+    tap_node(btn[0])
+    nodes, changed, ms = settle(prev, timeout=8000)
+    if not changed:
+        return None, ms
+    return nodes, ms
+
+def open_new_tab():
+    """面板里点"新建标签"，回到空白页。失败返回 False。"""
+    if not open_tabview():
+        return False
+    nodes = dump()
+    tile = next((n for n in nodes if "新建标签" in ((n.get("text") or "") + (n.get("contentDesc") or ""))
+                 and n.get("packageName") == PKG), None)
+    if not tile:
+        return False
+    tap_node(tile)
+    t0 = time.time()
+    while time.time() - t0 < 3:
+        time.sleep(0.4)
+        if not in_tabview(dump()):
+            return True
+    return False
+
+def _bar_retry(url, tries=1):
+    """intent 没落地时改走地址栏：新标签页/首页还在动画里，第一次常摸不到地址栏，故重试一次。"""
+    ms = 0
+    for i in range(tries):
+        time.sleep(0.5 if i == 0 else 0.8)
+        nodes, ms = via_bar(url)
+        if nodes is not None:
+            return nodes, ms
+    return None, ms
+
+def go(target, new_tab=True, human_dwell=True):
+    """开页并记账。改这里必须连带改 note_tab/retitle_active：只记"确认落地"的。"""
+    nodes, how, ms, note = _go_impl(target, new_tab=new_tab, human_dwell=human_dwell)
+    title = bar_text(nodes) if nodes else ""
+    if title:
+        if new_tab:
+            note_tab(title)                  # 新开的一页：一条记录
+        elif how == "地址栏":
+            rename_active(title)             # 同一标签里改地址：就地改名，别堆旧标题
+        else:
+            retitle_active(nodes)            # 不确定是不是同一个标签：宁可多记一条
+    return nodes, how, ms, note
+
+def _go_impl(target, new_tab=True, human_dwell=True):
+    url = _url_of(" ".join(target) if isinstance(target, list) else target)
+    nodes, ms, how, note = None, 0, "intent", ""
+    if HUMAN and new_tab and not re.search(r"[#;]", url):
+        # 拟人：人在地址栏里打字再前往。慢，但屏幕上有"输入"这个过程。
+        # new_tab=True 时必须**先开一张新标签**再打字：via_bar 改的是当前标签，
+        # 不加这一步会把用户正看着的那页顶掉（2026-11-22 复查发现）。
+        if open_new_tab():
+            nodes, ms = via_bar(url)
+            if nodes is not None:
+                return nodes, "地址栏", ms, "（拟人：新建标签后走地址栏）"
+        nodes = None                            # 没走通就退回其他路径，别把任务卡死
+        note = "（拟人：地址栏没走通，改用其他路径）"
+    if not new_tab or re.search(r"[#;]", url):
+        nodes, ms = via_bar(url)                    # intent 会截断锚点/分号参数
+        if nodes is not None:
+            how = "地址栏"
+            note = "（URL 含 # 或 ;，改走地址栏）" if new_tab else ""
+    if nodes is None and front() == PKG and bring_minis_front():
+        # 浏览器在前台 ⇒ Minis 在后台 ⇒ 系统会静默 cancel 这次 startActivity。
+        # 先把自己切回前台（Recents → Minis），切成功就走下面的 intent 快路径；
+        # 切不回来（没权限/找不到卡片）才退回"新建标签+地址栏"。
+        note = note or "（先把 Minis 切回前台，再用 intent）"
+    elif nodes is None and front() == PKG:
+        if new_tab:
+            if open_new_tab():
+                n4, ms4 = via_bar(url)
+                if n4 is not None:
+                    return n4, "新标签+地址栏", ms4, "（Minis 在后台，intent 必被拦）"
+            die(f"没打开：{url}", "新建标签后地址栏也没走通；bw shot 看一眼当前屏，或手动点开浏览器再说一次。", code=3)
+        die(f"没确认打开：{url}",
+            f"复用模式下地址栏没走通（当前页《{bar_text(dump()) or '空白'}》）。可以试 bw go --new。", code=3)
+    if nodes is None and front() != PKG:
+        # 只有 Minis 在前台时 VIEW intent 才会被系统放行（2026-11-22 子 agent 矩阵实测：
+        # 浏览器在前台＝Minis 在后台＝Android 10 直接 cancel 后台启动，且 startActivity 不报错）。
+        prev_title = bar_text(dump())
+        nodes, ms, changed = via_intent(url, wait_ms=3500)
+        title = bar_text(nodes)
+        how = "intent"
+        # 标题栏常常比正文慢半拍。正文已经够厚就先认这一页，别为标题再等 1.4s；
+        # 真空壳才补一次短等（原来固定 2×0.7s + 2 次 dump）。
+        if title in ("", "新标签页", "主页", "搜索或网址") and len(text_of(nodes, 10 ** 6)) < 300:
+            time.sleep(0.7)
+            nodes = dump()
+            title = bar_text(nodes)
+        if title in ("", "新标签页", "主页", "搜索或网址"):
+            # 有的浏览器版本吃掉 VIEW intent（只开一个新标签页、不落地 URL）：
+            # 先试一次地址栏，别直接判死；地址栏也走不通才报错。
+            n2, ms2 = _bar_retry(url)
+            if n2 is not None:
+                return n2, "地址栏", ms2, "（intent 没落地，改走地址栏）"
+            # 报事实，不猜病因：前台是谁、能不能读到浏览器界面，都是可观测的。
+            fg = front()
+            pk = [n for n in nodes if n.get("packageName") == PKG]
+            if fg != PKG:
+                die(f"没打开：前台是 {fg}，不是浏览器",
+                    "系统禁止后台启动（Minis 不在前台时拉起会被拦）。点一下 X 浏览器图标、再说一次。", code=3)
+            if not pk:
+                die("没打开：读不到浏览器界面",
+                    "只看到状态栏节点——屏幕可能锁着/熄了。亮屏解锁后再说一次。", code=3)
+            warn = flag(nodes).strip()
+            die(f"没打开：{url} 停在《{title or '空白'}》",
+                (warn + "\n  " if warn else "") + "页面本身是空白（不是前台问题，也不是读屏问题）；bw shot 看一眼，或换 bw go 重试。", code=3)
+        if not changed and title == prev_title:
+            # 页面一个字节都没变、地址栏又读不到 URL —— 无法确认是否打开。
+            # 这时**不许报成功、也不许记账**：本机实测过把用户自己的页面记成"我开的"，
+            # 下一次 close 就会去关人家的页（2026-11-21）。
+            # 地址栏能证明"已经是目标域名"→ 算落地，可以记账
+            host = re.sub(r"^[a-z]+://", "", url).split("/")[0]
+            # 键盘还没收 = 地址栏浮层（里面就是刚才打的字），不算落地
+            # 还要有正文：地址栏显示目标域名、但页面是空的，那是"没加载出来"，不是落地
+            # （2026-11-22 实测：一次失败的地址栏输入留下空白页，标题就是 URL，骗过了域名判据）
+            if host and not ime_up(nodes) and host in (bar_text(nodes) or "") \
+                    and len(text_of(nodes, 10 ** 6)) >= 80:
+                note = note or "（页面没重载，但地址栏已是目标域名）"
+            elif title:
+                # 页面一字节没变、地址栏又读不到 URL → 无法确认。
+                # 不许报成功、更不许记账：本机实测过把用户自己的页面记成"我开的"，
+                # 下一次 close 就会去关人家的页（2026-11-21）。
+                # intent 在"浏览器已在前台"时常常不跳（本机实测）。改走：新建标签 → 地址栏。
+                # 这样既不顶掉用户当前页，也能用地址栏真的落地。
+                if new_tab and open_new_tab():
+                    n3, ms3 = via_bar(url)
+                    if n3 is not None:
+                        return n3, "新标签+地址栏", ms3, "（intent 没跳，新建标签后走地址栏）"
+                die(f"没确认打开：{url} 页面没有任何变化（可能没跳转）",
+                    f"再试一次 bw go；或 --new 强制新开。当前页《{title}》我没有记账，close 不会动它。", code=3)
+            else:
+                note = note or "（内容与上一页相同，可能没真的跳转；不对就 bw go 再来一次）"
+    if human_dwell:
+        nap(0.5, 1.2)
+    return nodes, how, ms, note
+
+_WARNED_INTO = set()
+
+def find_editable(nodes, into=None):
+    """找输入框。--into 除了比框自己的文字/描述，还看它上下 80px 里贴着的那句提示词——
+    网页的 placeholder 常常是旁边一个独立节点，只比对控件本身永远匹配不上。"""
+    eds = [n for n in web_nodes(nodes) if n.get("editable")]
+    if not eds:
+        return None
+    if not into:
+        return eds[0]
+    texts = [(y, t) for y, _x, t, _n in page_items(nodes)]
+    def score(n):
+        if into in label(n):
+            return 0
+        b = n["bounds"]
+        for y, t in texts:
+            if b["top"] - 90 <= y <= b["bottom"] + 90 and into in t and len(t) <= 30:
+                return 1
+        return 9
+    best = min(eds, key=score)
+    if score(best) < 9:
+        return best
+    print(f"⚠ --into “{into}” 没匹配到任何框，落回第 1 个输入框")
+    return eds[0]
+
+def ime_up(nodes=None):
+    nodes = nodes if nodes is not None else dump()
+    return any("inputmethod" in (n.get("packageName") or "") for n in nodes)
+
+def find_submit_button(nodes, field):
+    """同一个输入框旁边、名字像“搜索/提交”的那个按钮。"""
+    fb = field["bounds"]
+    cands = []
+    for n in web_nodes(nodes):
+        if not n.get("clickable") or n.get("nodeId") == field.get("nodeId"):
+            continue
+        t = label(n)
+        b = n["bounds"]
+        if not t:
+            continue
+        if re.search(r"^(搜索|Search|查询|提交|前往|发送|Go|确定|登录|Login)$", t) and \
+                abs((b["top"] + b["bottom"]) // 2 - (fb["top"] + fb["bottom"]) // 2) < 160:
+            cands.append(n)
+    return cands[0] if cands else None
+
+def raise_ime(field, wait=1.8):
+    """把键盘叫出来。真手指点输入框才弹键盘，无障碍的 ACTION_CLICK 常常只给焦点。"""
+    b = field["bounds"]
+    a11y("tap", "xy", str((b["left"] + b["right"]) // 2),
+         str((b["top"] + b["bottom"]) // 2))
+    t0 = time.time()
+    while time.time() - t0 < wait:
+        if ime_up():
+            return True
+        time.sleep(0.15)
+    return False
+
+def press_ime_enter(y=None):
+    """只有键盘真的开着才按这个坐标——关着的话那位置是底部工具栏的“主页”。
+    y：键盘“前往/开始”键的纵坐标；不传就用实测默认（H-186，本机 Sogou 的“开始”键）。"""
+    if not ime_up():
+        return False
+    a11y("tap", "xy", str(int(W * 0.92)), str(y if y is not None else H - 186))
+    return True
+
+def type_into(text, into=None):
+    nodes = dump()
+    field = find_editable(nodes, into)
+    if not field:
+        die("这一屏没有可写的输入框", "先用 bw tap 点一下搜索框，或 bw go 直达 URL")
+    if not field.get("focused"):
+        b = field["bounds"]
+        a11y("tap", "xy", str((b["left"] + b["right"]) // 2), str((b["top"] + b["bottom"]) // 2))
+        # 只查两次：焦点要么很快到，要么根本没到（再等也是白等）。原来轮询 1.5s ≈ 最多 12 次 dump。
+        for wait in (0.25, 0.15):
+            time.sleep(wait)
+            nodes = dump()
+            f2 = find_editable(nodes, into)
+            field = f2 or field
+            if f2 and f2.get("focused"):
+                break
+    nap(0.2, 0.5)
+    if HUMAN:                                  # 一段一段敲，不是一次性贴上
+        acc, i = "", 0
+        while i < len(text):
+            step = random.randint(1, 3)
+            acc += text[i:i + step]
+            a11y("input", "text", acc, "--node", field["nodeId"])
+            i += step
+            time.sleep(random.uniform(0.07, 0.2))
+        got = acc
+    else:
+        r = a11y("input", "text", text, "--node", field["nodeId"])
+        if not r.get("ok"):
+            die("写不进输入框 " + str(r.get("error")))
+        got = text
+    nap(0.15, 0.35)
+    return got, field
+
+def do_submit(field, into, timeout=7000):
+    """提交并盯结果：键盘的搜索键 → 页面按钮 → 先把键盘叫出来再按。
+    谁能真的让页面动起来才算数，不然就继续换下一种。"""
+    t0 = time.time()
+    total = 0
+    nodes = dump()
+    plans = []
+    if ime_up(nodes):
+        plans.append(("键盘搜索键", "ime"))
+    btn = find_submit_button(nodes, field)
+    if btn:
+        plans.append((f"按钮“{label(btn)}”", "btn"))
+    if "ime" not in [p[1] for p in plans]:
+        plans.append(("键盘搜索键", "ime_raise"))
+    last_how = None
+    for how, kind in plans:
+        nodes = dump()
+        if kind in ("ime", "ime_raise"):
+            if kind == "ime_raise":
+                f2 = find_editable(nodes, into) or field
+                if not raise_ime(f2):
+                    continue
+            if not press_ime_enter():
+                continue
+        else:
+            tap_node(find_submit_button(nodes, field) or btn)
+        time.sleep(1.0)                      # 页面切换有个过程，先让它开始动
+        nodes, changed, ms = settle(sig(nodes), timeout=timeout, need_chars=300)  # 420 会让短结果页白等 3s
+        total = int((time.time() - t0) * 1000)
+        last_how = how
+        if changed:
+            return how, nodes, True, total
+        if HUMAN:
+            nap(0.3, 0.7)
+    return last_how, nodes, False, total
+
+def chip(word, nodes=None):
+    """底部/顶部工具栏按钮：文字是空的，只有 contentDesc。"""
+    nodes = nodes if nodes is not None else dump()
+    for n in nodes:
+        if n.get("packageName") == PKG and n.get("clickable") and label(n) == word:
+            return n
+    return None
+
+def in_tabview(nodes=None):
+    """标签面板的唯一可观测标记：面板里有"新建标签"这张卡。
+    页面里的正文块几何上与卡片一样（实测 iana 页被当成 6 张卡），只靠几何认会认错。"""
+    nodes = nodes if nodes is not None else dump()
+    return any(label(n) == "新建标签" for n in nodes)
+
+def open_tabview(wait=0.9, tries=3):
+    """进标签面板，**看见"新建标签"才算进去了**。已经在面板里就直接返回 True。"""
+    for _ in range(tries):
+        nodes = dump()
+        if in_tabview(nodes):
+            return True
+        n = chip("打开的标签", nodes)
+        if not n:
+            time.sleep(0.3)
+            continue
+        tap_node(n)
+        t0 = time.time()
+        while time.time() - t0 < wait:
+            time.sleep(0.25)
+            if in_tabview(dump()):
+                return True
+    return False
+
+def tab_rows(nodes):
+    """标签管理里的一张张卡片：标题是卡片里那条长文本。"""
+    rows = []
+    for n in nodes:
+        b = n.get("bounds") or {}
+        t = label(n)
+        if n.get("packageName") != PKG or not t or n.get("clickable"):
+            continue
+        if b.get("left", 999) < 260 and b.get("right", 0) - b.get("left", 0) > 400 \
+                and TOP - 20 < b.get("top", 0) < BOTTOM:
+            rows.append(n)
+    return rows
+
+def close_tab_row(nodes, row):
+    y = (row["bounds"]["top"] + row["bounds"]["bottom"]) // 2
+    xs = [n for n in nodes if n.get("packageName") == PKG and n.get("clickable")
+          and n["bounds"]["left"] > 0.80 * W
+          and abs((n["bounds"]["top"] + n["bounds"]["bottom"]) // 2 - y) < 60]
+    if not xs:
+        return False
+    b = xs[0]["bounds"]
+    # 用坐标点，不用 tap node：nodeId 跨 dump 会变，实测点 nodeId 有时毫无反应
+    r = a11y("tap", "xy", str((b["left"] + b["right"]) // 2), str((b["top"] + b["bottom"]) // 2))
+    time.sleep(0.55)
+    return bool(r.get("ok"))
+
+def _match_count(title, rows=None):
+    """面板里和这个标题匹配的卡片有几张（同名两张时是 2）。"""
+    rows = tab_rows(dump()) if rows is None else rows
+    return sum(1 for r in rows if _title_match(label(r), title))
+
+def _wait_less(title, before, tries=6, wait=0.4):
+    """等到匹配这张标题的卡片比 before 少，才算真的关掉一张。
+    只数"全屏卡片少了几个"会出事：实测关掉一张后卡片上移，同一个 y 落到下一张，
+    连点几次就把别人的卡陆续关掉（2026-11-19 事故）。所以按"这个标题的匹配数"判。"""
+    for _ in range(tries):
+        if _match_count(title) < before:
+            return True
+        time.sleep(wait)
+    return False
+
+def session_titles():
+    st = load_state()
+    ts = [t["title"] for t in st["tabs"]]
+    if st.get("last") and st["last"] not in ts:
+        ts.append(st["last"])
+    return ts
+
+def _cards(nodes=None):
+    """面板里的卡片。不在面板里就返回空——不许把网页正文当卡片数。
+    面板是底部弹层，dump 里同时有网页正文（实测 11 张卡 + 6 段网页文字），
+    所以只取"从第一张卡开始、按卡片间距连续排列"的那一串。"""
+    nodes = nodes if nodes is not None else dump()
+    if not in_tabview(nodes):
+        return []
+    rows = tab_rows(nodes)
+    if not rows:
+        return []
+    # 卡片判据改成"右侧有一颗 ×"：卡片标题那条文字，同一 y 带上会有一颗靠右的小图标。
+    # 以前用"出现最多的 (left,right)"当模板，换机就翻车：本机（1280x2772）网页正文是 L104/R1176
+    # 共 6 行、卡片是 L170/R1117 只有 2 行，模板反而选成网页正文（2026-11-21 实测）。
+    # × 判据跨机型稳定：图标必须可点、靠右（left > 0.80W）、够小（宽 < 0.15W、高 < 0.08H）。
+    xs = [n["bounds"] for n in nodes
+          if n.get("packageName") == PKG and n.get("clickable")
+          for b in [n.get("bounds") or {}]
+          if b.get("left", 0) > 0.80 * W
+          and b.get("right", 0) - b.get("left", 0) < 0.15 * W
+          and b.get("bottom", 0) - b.get("top", 0) < 0.08 * H]
+
+    def has_x(b):
+        y = (b.get("top", 0) + b.get("bottom", 0)) // 2
+        return any(abs((x.get("top", 0) + x.get("bottom", 0)) // 2 - y) < 0.05 * H for x in xs)
+
+    rows = [r for r in rows if has_x(r["bounds"]) and label(r) != "新建标签"]
+    if not rows:
+        return []
+    # 再按左右边界收敛一次：网页正文偶尔也会挨着一颗小图标，但它的 left 比卡片更靠边。
+    # 在"带 ×"的行里取出现最多的 (left,right)；并列时取 left 更大的那组（卡片有内缩）。
+    from collections import Counter
+    pairs = Counter((r["bounds"]["left"], r["bounds"]["right"]) for r in rows)
+    top_cnt = max(pairs.values())
+    cands = [k for k, v in pairs.items() if v == top_cnt]
+    pair = max(cands, key=lambda k: k[0])
+    rows = sorted([r for r in rows if (r["bounds"]["left"], r["bounds"]["right"]) == pair],
+                  key=lambda r: r["bounds"]["top"])
+    if not rows:
+        return []                               # 只剩磁贴 = 一个标签都没有
+    out = [rows[0]]
+    for r in rows[1:]:                          # 再按间距断一次：卡片列表中间不会空一大截
+        if r["bounds"]["top"] - out[-1]["bounds"]["top"] <= 240:
+            out.append(r)
+    return out
+
+def _stable_count(tries=3):
+    """连续两次读到一样多才算数；动画中途的数字不能用来判断"少了几张"。"""
+    last = None
+    for _ in range(tries):
+        n = len(_cards())
+        if last is not None and n == last:
+            return n
+        last = n
+        time.sleep(0.35)
+    return last
+
+def _trim(s):
+    return (s or "").strip().rstrip("…").strip()
+
+def _title_match(label_txt, title):
+    """卡片文字和记账标题是不是同一个页面。三种情况算命中：
+    完全相同 / 卡片被截断（卡片是标题的前缀）/ 标题被截断（标题是卡片的前缀且后面不是字母数字）。
+    最后那条是用来挡住 "Example Domain" 匹到 "Example Domains" 的。"""
+    a, b = _trim(label_txt), _trim(title)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if b.startswith(a):                      # 卡片被截断
+        return True
+    if a.startswith(b):                      # 记账被截断
+        return len(a) == len(b) or not a[len(b)].isalnum()
+    return False
+
+def _row_of(rows, title):
+    """卡片里哪一张是这条记录。空标题不按文本认（认不出），交给"总数差"兜底。"""
+    if not _trim(title):
+        return None
+    for r in rows:
+        if _title_match(label(r), title):
+            return r
+    return None
+
+# 关闭动作的安全闸：真机验收通过前只核对不点。
+# 验收期间用 BW_CLOSE_FORCE=1 单次强开（不要改成默认 True，除非连续两次真机关闭都对）。
+# 2026-11-19 真机连续两次验证通过（10→8、9→8，面板数一致），默认开；
+# 想临时禁用：BW_CLOSE_FORCE=0
+# 2026-11-19 事故与修复：
+#   事故：一次 close 报"关 7 个"，实际连坐关掉用户 5 张卡——根因是按"全屏卡片数变少"判定，
+#         关掉一张后卡片上移，同一个 y 又落到下一张，于是被逐个点掉。
+#   修复：① 标题严格匹配（"Example Domain" 不再匹到 "Example Domains"）；
+#         ② 点完按"这个标题的匹配数少一张"判定，不按全屏总数；
+#         ③ 点一下没少就立刻停手，不重试；④ × 用坐标点，不用会失效的 nodeId。
+#   验证：桩测 5 例（含前缀陷阱/同名两张/点不动）+ 真机 4 次（每次只关 1 张，其余 6→3 张全是我的）。
+# 想临时禁用：BW_CLOSE_FORCE=0
+CLOSE_VERIFIED_OK = os.environ.get("BW_CLOSE_FORCE", "1") != "0"
+
+def close_verified(titles, max_taps=40):
+    """按记账关标签，**每一步都回读屏幕**：卡片数真的少了才算关掉。
+    返回 {status, closed, remaining, before, after}。status ∈ ok / partial / env / noview。
+    绝不"点了就当关了"——这正是 "bw close 说关了其实没关" 的第一条根因。"""
+    titles = [t for t in titles]
+    if front() != PKG and not bring_front():
+        return {"status": "env", "closed": [], "remaining": titles, "before": None, "after": None}
+    if not open_tabview():
+        return {"status": "noview", "closed": [], "remaining": titles, "before": None, "after": None}
+    # 再确认一次真的在面板里：本机出现过"open_tabview 说成功了，但屏幕已经被动画/别的动作带回去"，
+    # 这时数到的 before 是 0，后面就会把"没看见"当成"我的标签都没了"，把账删光（2026-11-21 事故）。
+    if not in_tabview(dump()):
+        return {"status": "noview", "closed": [], "remaining": titles, "before": None, "after": None}
+    # 卡片要等它画出来：刚切进面板时 dump 可能在动画中，一张都数不到。
+    # 数不到就重开一次面板；仍然 0 张 = 这次没看清 → noview，**绝不能**当成"我的标签都不在了"（2026-11-22 复现）。
+    before = _stable_count()
+    t0 = time.time()
+    while before == 0 and time.time() - t0 < 2.5:
+        time.sleep(0.35)
+        before = _stable_count()
+    if before == 0:
+        a11y("input", "key", "back")
+        if not open_tabview() or not in_tabview(dump()):
+            return {"status": "noview", "closed": [], "remaining": titles, "before": None, "after": None}
+        t1 = time.time()
+        while before == 0 and time.time() - t1 < 2.5:
+            time.sleep(0.35)
+            before = _stable_count()
+        if before == 0:
+            a11y("input", "key", "back")
+            return {"status": "noview", "closed": [], "remaining": titles, "before": None, "after": None}
+    before_names = [label(r) for r in _cards()]
+    if not CLOSE_VERIFIED_OK:
+        # 真机实测：× 的可点区域未确认，点了可能反而"打开标签"。在确认之前一律不动手。
+        a11y("input", "key", "back")
+        return {"status": "dry", "closed": [], "remaining": list(dict.fromkeys(titles)),
+                "unseen": [], "before": before, "after": before}
+    closed, failed, taps = [], [], 0
+    for name in dict.fromkeys(titles):           # 同名多条记录 → 一次关一张，循环会再来
+        need = titles.count(name)
+        got = 0
+        tries = 0
+        while got < need and taps < max_taps and tries < 3:
+            nodes = dump()                         # × 按钮在完整节点里，tab_rows 只返回卡片文字节点
+            rows = tab_rows(nodes)
+            row = _row_of(rows, name)
+            if row is None:
+                break                              # 面板里没有这张卡了（关掉了 / 本来就不在）
+            seen = label(row)                      # 点之前记下这张卡当时的样子
+            before_n = _match_count(name, rows)    # 同名几张：要按"少一张"判
+            tries += 1
+            if not close_tab_row(nodes, row):
+                failed.append(name)
+                break
+            taps += 1
+            if _wait_less(name, before_n):         # 判据：这个标题的匹配数真的少了一张
+                closed.append(name)
+                got += 1
+            else:
+                # 没关掉就别再点第二下：上移的卡片会让下一枪打到别人身上
+                failed.append(name)
+                print(f"… 点了 × 但《{seen[:24]}》还在，停手（不再重试）")
+                break
+    after = _stable_count()
+    after_rows = _cards()
+    after_names = [label(r) for r in after_rows]
+    # 关前有、关后没了、又不是我关的 → 有东西被误伤（2026-11-19 连坐事故的形状）
+    from collections import Counter as _C
+    cb, ca, cc = _C(before_names), _C(after_names), _C(closed)
+    ghost = []
+    for n in set(before_names):                  # 逐标题比数量，避免"标题变了"被误判成误伤
+        expect = cb[n] - sum(v for k, v in cc.items() if _title_match(n, k) or _title_match(k, n))
+        if ca[n] < max(0, expect):
+            ghost.append(f"{n[:20]} 少 {max(0, expect) - ca[n]} 张")
+    names = list(dict.fromkeys(titles))
+    still = [t for t in names if _row_of(after_rows, t) is not None and t not in closed]
+    # 找不到 ≠ 已关掉：标签可能在加载中改了标题（实测见过 "Example Domain" → "请稍候…"），
+    # 也可能真被手动关掉。分不清就如实分成两栏，别用"已不在"把记录擦掉。
+    unseen = [t for t in names if t not in still and t not in closed]
+    a11y("input", "key", "back")
+    drift = None if (before is None or after is None) else after - (before - len(closed))
+    st = "ok" if not still and not unseen else "partial"
+    # 只接受"正好少 len(closed) 张"；少了更多说明可能多关了，多了说明别人在开。
+    # 例外：关到 0 张时面板自动退出，计数不可靠，按 closed 认定。
+    suspicious = (drift is not None and drift != 0 and not (after == 0 and closed)) or bool(ghost)
+    if suspicious:
+        # 2026-11-19 实测踩到：before=5 关了 2 张，after=12（期间冒出 7 张）。
+        # 面板数量对不上，说明有别的东西在同一时间开/关标签——这时任何 ✔ 都是猜的。
+        st = "changed"
+    return {"status": st, "closed": closed, "remaining": still, "unseen": unseen,
+            "before": before, "after": after, "drift": drift, "ghost": ghost}
+
+def prune_state(closed, remaining, unseen=(), inspected=True):
+    """只删"核实关掉"的；仍在面板的、以及找不到的，都留着并 tries+1。
+    连续 3 次才放弃（放弃必须在输出里说出来）——账本少一条 = 那个标签可能永远关不掉。"""
+    st = load_state()
+    left = {}
+    for t in list(remaining) + list(unseen):
+        left[t] = left.get(t, 0) + 1
+    keep, dropped = [], []
+    if not inspected:                      # 没进面板/没核对：账本一个字都不动
+        return dropped
+    for rec in st["tabs"]:
+        t = rec.get("title") or ""
+        if closed and t in closed:
+            closed.remove(t)                       # 同名多条：关掉几条就删几条
+            continue
+        if left.get(t, 0) > 0:
+            left[t] -= 1
+            rec["tries"] = rec.get("tries", 0) + 1
+            if rec["tries"] >= 3:
+                dropped.append(t)
+                continue
+            keep.append(rec)
+        else:
+            rec["tries"] = rec.get("tries", 0) + 1
+            if rec["tries"] >= 3:
+                dropped.append(rec.get("title") or "")
+                continue
+            keep.append(rec)                        # 面板里找不到 ≠ 关掉了：留着，3 次后才放弃
+    st["tabs"] = keep
+    st["active"] = len(keep) - 1 if keep else None
+    st["last"] = keep[-1]["title"] if keep else None
+    save_state(st)
+    return dropped
+
+# ---------- 子命令 ----------
+def cmd_fast(a):
+    """只读的活别动屏幕：内置 WebView 取正文，40ms 拿到，不占用户的手机。"""
+    url = _url_of(" ".join(a.target))
+    t0 = time.time()
+    p = subprocess.run(["minis-browser-use", "navigate", "--url", url],
+                       capture_output=True, text=True, timeout=60)
+    nav = int((time.time() - t0) * 1000)
+    if '"ok": true' not in p.stdout:
+        print(f"✘ 内置浏览器打不开（{p.stdout.strip()[:100]}）——换外置：bw go {url}")
+        sys.exit(2)
+    r = subprocess.run(["minis-browser-use", "get_readable"], capture_output=True, text=True, timeout=30)
+    try:
+        txt = json.loads(r.stdout)["data"]["text"]
+    except Exception:                                          # noqa: BLE001
+        print("✘ 取正文失败：" + (r.stdout.strip()[:120] or r.stderr.strip()[:120]))
+        sys.exit(2)
+    rd = int((time.time() - t0) * 1000) - nav
+    body = txt.strip()
+    if body.startswith("Title:"):
+        body = body.split("\n", 1)[-1]
+    body = re.sub(r"\n\s*(tab_id|url|shot)\s*:.*$", "", body)   # 别把内部元数据当正文
+    print(f"✔ 内置取正文 · 打开 {nav}ms · 读完 {rd}ms · {len(txt)} 字")
+    if len(txt) < 200:
+        print("… 这点字多半是登录墙或纯 JS 页面——要登录态就用 bw go（X 浏览器）")
+    print(body[:a.max])
+
+def bring_front(wait=3.0, tries=2):
+    """把浏览器切到前台。以前这是一条命令，现在只是守卫里的一个动作。
+    刚回桌面时系统可能拦一次后台启动，所以重试一次。"""
+    for _ in range(tries):
+        _open(["intent:#Intent;action=android.intent.action.MAIN;category=android.intent.category.LAUNCHER;"
+               "component=" + PKG + "/.BrowserActivity;end"])
+        t0 = time.time()
+        while time.time() - t0 < wait:
+            if front() == PKG:
+                return True
+            time.sleep(0.15)
+    return False
+
+def cmd_go(a):
+    # 默认不新开标签：能不新开就不新开——"不用关"比"关得准"更可靠。
+    # 判据只看一件事：当前页的标题在不在我的记账里。在 → 是我开的，可以复用；不在 → 是用户的，新开。
+    mine = {t for t in session_titles() if t}
+    cur = bar_text(dump())
+    if a.new:
+        new_tab, why = True, "（--new）"
+    elif a.reuse:
+        new_tab, why = False, "（--reuse）"
+    elif cur and cur in mine:
+        new_tab, why = False, "（复用我自己开的这一页）"
+    else:
+        new_tab, why = True, "（当前页不是我的，新开）"
+    nodes, how, ms, note = go(a.target, new_tab=new_tab, human_dwell=not a.fast)
+    print(f"✔ 打开 · {how} · {ms}ms {why}" + (f" {note}" if note else ""))
+    print(render(nodes, maxc=a.max))
+
+def cmd_read(a):
+    nodes, moved, ms = dump(), "", 0
+    if a.count:
+        nodes, moved, ms = scroll_n("up" if a.up else "down", a.count, a.timeout)
+    if getattr(a, "pause", False) and HUMAN:
+        time.sleep(min(1.2, len(text_of(nodes, 10 ** 6)) / 900))
+    out = render(nodes, maxc=a.max, force=True)
+    if a.count:
+        print(f"{'✔' if moved == 'moved' else '…'} {'上' if a.up else '下'}滑 {a.count} 屏 · {ms}ms · "
+              + {"moved": "有新内容", "end": "很可能到底了", "stale": "节点没跟着动（该站已知问题，可能真到底，也可能要截图看）"}[moved])
+    print(out)
+    if getattr(a, "pause", False):
+        # 停顿要在"结果已经打出去"之前有意义；打在后面只是让调用方干等。
+        # 所以默认不做，要节奏就用 --pause（≤1.2s），且它发生在 print 之前的那次等待里。
+        pass
+
+def cmd_state(a):
+    nodes = dump()
+    items = page_items(nodes)
+    txt = text_of(nodes, 10 ** 6)
+    print(f"《{bar_text(nodes) or '?'}》 前台={front()} 正文块={len(items)} 字={len(txt)} "
+          f"登录墙={'有' if any('登录' in t for _y, _x, t, _n in items[:8]) else '无'}")
+
+IRREVERSIBLE = re.compile(r"^(提交|支付|下单|购买|确认付款|确认支付|发送|发表|发布|删除|清空|退出|注销|"
+                          r"授权|允许|安装|下载|关注|取消关注|取关|解绑|充值|转账|退订)$")
+
+def rank_cands(cand, target, title=""):
+    """重名时自己挑一个：完全匹配 > 前缀 > 包含；不是页面标题的优先（标题那条常常是
+    搜索框里的回声或 H1，点了等于再搜一次）；再优先可点击；最后按阅读顺序取最上最左。
+    网页里点错链接是免费的（bw key back 一句就退回），停下来问反而更贵。"""
+    low = any(it[3]["bounds"]["top"] >= 360 for it in cand)
+
+    def key(it):
+        t = it[2]
+        m = 0 if t == target else (1 if t.startswith(target) else 2)
+        echo = 1 if (title and t == title) else 0
+        if low and it[3]["bounds"]["top"] < 360:
+            echo += 2                      # 页面头部区域（搜索框/导航）里的重名，最后才考虑
+        clickable = 0 if it[3].get("clickable") else 1
+        b = it[3]["bounds"]
+        return (echo, m, clickable, b["top"] // 8, b["left"])
+    return sorted(cand, key=key)
+
+def tap_text(target, nth=None, timeout=5000):
+    """找到并点中。返回 (nodes, 变化了吗, 用时ms, 点中的标签)。
+    找不到就 die；命中多个默认自己挑最像的那个，并在一行里说清挑了谁、还剩谁。"""
+    nodes = dump()
+    items = page_items(nodes)
+    t = target.strip()
+    exact = [it for it in items if it[2] == t]
+    cand = exact or [it for it in items if t in it[2]]
+    if not cand:
+        die(f'这一屏没有“{target}”', "先 bw read 看看；或 bw read -n 1 往下翻一屏再找")
+    note = ""
+    if len(cand) > 1 and nth is None:
+        if IRREVERSIBLE.match(t):
+            print(f"✘ “{target}” 是敏感动作且命中 {len(cand)} 个，不敢替你挑：")
+            for it in cand[:6]:
+                print(f"  {it[2][:40]} @{it[3]['bounds']['left']},{it[3]['bounds']['top']}")
+            print("  用 --nth N 指定")
+            sys.exit(3)
+        cand = rank_cands(cand, t, bar_text(nodes))
+        others = [it[2][:16] for it in cand[1:4]]
+        note = f"（{len(cand)} 个同名，取最上那个；其余：" + " / ".join(others) + "）"
+    pick = cand[(nth or 0) % len(cand)]
+    nodes, changed, ms = tap_and_wait(pick[3], timeout, before_sig=sig(nodes))
+    return nodes, changed, ms, pick[2][:36] + note
+
+def tap_and_wait(node, timeout=5000, before_sig=None):
+    """点一下再等页面动。before_sig 由调用方传入（它刚 dump 过），省一次 dump ≈300ms。"""
+    before = before_sig if before_sig is not None else sig(dump())
+    nap(0.15, 0.5)
+    if tap_node(node) == "fail":
+        die("点击注入失败", "没点下去，别接着做；bw shot 看一眼再决定", code=3)
+    nodes, changed, ms = settle(before, timeout=timeout)
+    if changed:
+        nodes = patience(nodes)
+        retitle_active(nodes)
+    return nodes, changed, ms
+
+def scroll_n(direction, n, timeout=3500):
+    nodes = dump()
+    before = sig(nodes)
+    for i in range(n):
+        if direction == "up":
+            swipe_down()
+        else:
+            swipe_up()
+        if HUMAN:
+            time.sleep(random.uniform(0.25, 0.7))
+            if n > 2 and i == n - 2 and random.random() < 0.3:   # 偶尔往回瞟一眼
+                swipe_down(dist=random.randint(240, 420))
+                time.sleep(random.uniform(0.3, 0.6))
+    nodes, changed, ms = settle(before, timeout=timeout)
+    if changed:
+        return nodes, "moved", ms
+    # 没变化：到底了，还是这个站的节点不跟着滚？给两个假设，不替模型下结论
+    items = page_items(nodes)
+    at_end = bool(items) and items[-1][3]["bounds"]["bottom"] >= BOTTOM - 40
+    return nodes, ("end" if at_end else "stale"), ms
+
+def cmd_tap(a):
+    nodes, changed, ms, lab = tap_text(a.target, a.nth, a.timeout)
+    print(f"{'✔' if changed else '…'} tap “{lab}” · {ms}ms · {'页面变了' if changed else '没变化'}")
+    print(render(nodes, maxc=a.max))
+    if not changed:
+        sys.exit(3)                       # 有效果不确定：让 && 链自己停下来
+
+def cmd_type(a):
+    text = " ".join(a.text)
+    got, field = type_into(text, a.into)
+    if a.submit:
+        how, nodes, changed, ms = do_submit(field, a.into, a.timeout)
+        print(f"✔ 写入 “{got[:40]}” · 提交 {how or '没找到按钮'} · {ms}ms · {'页面变了' if changed else '页面没动'}")
+        if HUMAN and changed:
+            nap(0.8, 1.8)
+        if not changed:
+            print(render(nodes, maxc=a.max))
+            sys.exit(3)
+    else:
+        nodes = dump()
+        print(f"✔ 写入 “{got[:40]}” · 没提交（加 --submit 才发送）")
+    print(render(nodes, maxc=a.max))
+
+RESULT_NOISE = re.compile(r"(Translate this result|^\d+$|^https?://|›|^Search|^ALL$|^IMAGES$|^WEB$|^VIDEOS$)")
+
+def result_titles(nodes, query="", site=None):
+    """搜索结果页上"像一条结果"的文字：可点、够长、下面还跟着摘要。
+    这样能避开搜索框里的词、联想 chip、右边栏的“相关搜索”。"""
+    items = page_items(nodes)
+    min_y = 320
+    for y, x, t, n in items:
+        if re.search(r"(results|条结果|个结果|搜索结果)", t) and len(t) < 40:
+            min_y = y + 8
+            break
+    q = re.sub(r"\s+", "", query)
+    out = []
+    for y, x, t, n in items:
+        if y < min_y or not n.get("clickable"):
+            continue
+        tt = re.sub(r"\s+", "", t)
+        if q and tt == q:
+            continue
+        if q and tt.startswith(q) and len(tt) <= len(q) + 12:
+            continue                      # “把搜索词再念一遍”的联想 chip，不是结果
+        if site:
+            src = source_of(nodes, n)
+            if not src or not src.endswith(site):
+                continue                  # 给了 --site 就只认这个来源，宁可 0 条
+        if not (14 <= len(t) <= 90) or CHROME.match(t) or RESULT_NOISE.search(t):
+            continue
+        snippet = [tt for yy, _x, tt, _n in items
+                   if 20 < yy - y < 130 and not _n.get("clickable") and len(tt) > 25]
+        if not snippet:
+            continue
+        if any(abs(y - yy) < 40 and t == tt for yy, _x, tt, _n in out):
+            continue
+        out.append((y, x, t, n))
+    return out
+
+DOMAIN = re.compile(r"\b([a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\."
+                    r"(?:gov\.cn|edu\.cn|com\.cn|org\.cn|net\.cn|cn|com|org|net|io))\b", re.I)
+
+def source_of(nodes, title_node):
+    """标题上方那行小字里通常有域名；抓不到就算了，不编。"""
+    top = title_node["bounds"]["top"]
+    for y, _x, t, _n in page_items(nodes):
+        if top - 62 <= y <= top - 2:
+            m = DOMAIN.search(t)
+            if m:
+                return m.group(1).lower()
+    return ""
+
+def cmd_find(a):
+    """搜索 → 打开第 N 条结果 → 把正文拿回来。一条命令干完三件事。"""
+    q = " ".join(a.query)
+    if a.site:
+        q = f"{q} site:{a.site}"
+    t0 = time.time()
+    nodes, how, ms, note = go(q, new_tab=True, human_dwell=not a.fast)
+    # 落到搜索页才算数：intent 有时停在原页面不动（本机实测），那就用地址栏再走一次
+    ttl = bar_text(nodes) or ""
+    if not re.search(r"搜索|Search|必应|Bing|百度", ttl):
+        n2, ms2 = via_bar(_url_of(q))
+        if n2 is not None:
+            nodes, how, ms, note = n2, "地址栏", ms2, "（搜索页没开，改走地址栏）"
+    titles = result_titles(nodes, re.sub(r"\s+", "", q.split(" site:")[0]), a.site)
+    # 本机（Bing 移动版）结果块是延迟渲染的：刚落地只有搜索框 132 字，6–8s 后才出条目。
+    # 原来只解析一次，直接判成"0 条结果"，把"还没画完"当成"没有结果"（2026-11-21 实测）。
+    t1 = time.time()
+    while len(titles) < a.n and time.time() - t1 < 4:
+        time.sleep(0.8)
+        nodes = dump()
+        titles = result_titles(nodes, re.sub(r"\s+", "", q.split(" site:")[0]), a.site)
+    if len(titles) < a.n:
+        # 本机必应移动版：顶部先给一张广告卡，真结果在下面一屏。往下翻一次再解析。
+        for _ in range(2):
+            if len(titles) >= a.n:
+                break
+            swipe_up()
+            t2 = time.time()
+            while time.time() - t2 < 3:
+                time.sleep(0.6)
+                nodes = dump()
+                titles = result_titles(nodes, re.sub(r"\s+", "", q.split(" site:")[0]), a.site)
+                if len(titles) >= a.n:
+                    break
+    if len(titles) < a.n:
+        why = f"（--site {a.site} 下 0 条命中）" if a.site and not titles else f"（只有 {len(titles)} 条像结果的）"
+        print(f"… 没打开任何页 {why}，下面是搜索结果：")
+        print(render(nodes, maxc=a.max))
+        sys.exit(2)                      # 一条都没开就是硬失败：exit 0 会让 a && b 接着跑
+    pick = titles[a.n - 1]
+    src = source_of(nodes, pick[3])
+    try:
+        nodes, ch, ms2 = tap_and_wait(pick[3], a.timeout)
+    except SystemExit:
+        print("   ✘ 点不开这一条，下面是搜索结果：")
+        print(render(nodes, maxc=a.max))
+        sys.exit(2)
+    lab = pick[2][:36]
+    src = f" · 来源 {src}" if src else " · 来源未识别"
+    print(f"✔ 搜“{q}” → 第 {a.n}/{len(titles)} 条《{lab}》{src} · {int((time.time()-t0)*1000)}ms")
+    print(render(nodes, maxc=a.max))
+
+def cmd_key(a):
+    before = sig(dump())
+    name = a.name
+    if name in ("reload", "刷新"):
+        btn = [n for n in dump() if n.get("packageName") == PKG and n.get("clickable")
+               and 0.77 * W <= n["bounds"]["left"] <= 0.875 * W and n["bounds"]["top"] < TOP - 5]
+        if not btn:
+            die("找不到刷新按钮")
+        tap_node(btn[0])
+    elif name in ("fwd", "forward", "前进"):
+        n = chip("前进")
+        if not n:
+            die("找不到前进按钮")
+        tap_node(n)
+    elif name in ("back", "返回"):
+        n = chip("后退")
+        tap_node(n) if n else a11y("input", "key", "back")
+    elif name in ("home", "主页"):
+        a11y("input", "key", "home")
+        print("✔ 回桌面")
+        return
+    else:
+        a11y("input", "key", name)
+    nodes, changed, ms = settle(before, timeout=a.timeout)
+    print(f"{'✔' if changed else '…'} {name} · {ms}ms · {'页面变了' if changed else '页面没动'}")
+    print(render(nodes, maxc=a.max))
+
+def list_tabs():
+    st = load_state()
+    tabs, cur = st.get("tabs", []), st.get("last")
+    if not tabs:
+        print("… 这次没开过标签（只读任务走 bw fast 不会产生标签）")
+        return
+    print(f"我这次开的标签（{len(tabs)} 个，近的在后）：")
+    for i, t in enumerate(tabs, 1):
+        mark = " ← 当前" if t["title"] == cur else ""
+        print(f"  {i}. {t['title'][:44]}{mark}")
+    print("切回某个：bw tabs 2 / bw tabs 知乎    关掉：bw close")
+
+def switch_tab(which):
+    st = load_state()
+    tabs = st.get("tabs", [])
+    if not tabs:
+        die("记账里没有我开的标签", "用 bw go 开一个，或 bw tabs 看看")
+    target, idx = None, None
+    if which.isdigit():
+        idx = int(which) - 1
+        if 0 <= idx < len(tabs):
+            target = tabs[idx]
+    else:
+        for i, t in enumerate(tabs):
+            if which[:12] in t["title"] or which in t["title"]:
+                target, idx = t, i
+                break
+    if not target:
+        print(f"✘ 记账里没有 “{which}”，可选：")
+        for i, t in enumerate(tabs, 1):
+            print(f"  {i}. {t['title'][:40]}")
+        sys.exit(3)
+    if not open_tabview():
+        die("没能打开标签管理")
+    nodes = dump()
+    rows = tab_rows(nodes)
+    hit = next((r for r in rows if target["title"][:10] in label(r)), None)
+    if not hit:
+        rows = tab_rows(dump())
+        hit = next((r for r in rows if which in label(r)), None)
+    if not hit:
+        a11y("input", "key", "back")
+        die(f"标签列表里没找到《{target['title'][:20]}》", "它可能已经被关掉了；bw go 重新打开")
+    b = hit["bounds"]
+    a11y("tap", "xy", str((b["left"] + b["right"]) // 2), str((b["top"] + b["bottom"]) // 2))
+    nodes, changed, ms = settle(sig(nodes), timeout=4000)
+    got = bar_text(nodes)
+    if not got or got[:8] not in target["title"]:
+        a11y("input", "key", "back")
+        die(f"点了但没切过去（现在是《{got or '?'}》）", "重试一次；还不行就用 bw go 重开")
+    st["active"], st["last"] = idx, target["title"]
+    save_state(st)                    # 切标签只改指针，不往记账里追加
+    print(f"✔ 切到《{got}》 · {ms}ms")
+    print(render(nodes, maxc=1200))
+
+def cmd_tabs(a):
+    if a.op in (None, "ls"):
+        return list_tabs()               # 纯本地记账，不需要前台
+    if front() != PKG and not bring_front():
+        die("前台不是 X 浏览器，自动拉起也没成功", "先 bw go <url>")
+    if a.op == "close":
+        if not a.arg:
+            die("要说关哪个", "bw tabs close <标题片段>")
+        r = close_verified([a.arg])
+        if r["status"] == "dry":
+            print(f"… 没关（关闭动作在真机验收前被禁用）；面板里现 {r['before']} 张卡")
+            sys.exit(3)
+        if r["status"] in ("env", "noview"):
+            die("没法关：前台不是浏览器或打不开标签管理", "先 bw go <url>，再 bw tabs close " + a.arg, code=3)
+        if not r["closed"]:
+            print(f"✘ 没关掉：“{a.arg}” 不在标签面板里，或 × 点不掉"
+                  f"（before={r['before']} after={r['after']}）")
+            sys.exit(3)
+        print(f"✔ 关掉并核实 {len(r['closed'])} 个：" + "；".join(c[:30] for c in dict.fromkeys(r["closed"])))
+        return
+    if a.op == "verify":
+        titles = [t for t in dict.fromkeys(session_titles()) if t]
+        if front() != PKG and not bring_front():
+            die("前台不是 X 浏览器，没法核对", "先 bw go <url>；或手动点开标签数", code=2)
+        if not open_tabview():
+            die("打不开标签管理，没法核对", "手动点开地址栏旁的标签数再看一次", code=2)
+        # 必须用同一套卡片判据（别再数一遍 tab_rows，会把网页正文算成卡）；
+        # 也要等它画出来：刚切进面板时 _cards() 可能是 0 张，直接报"0 张卡"就是假话（2026-11-22 实测）。
+        labels, t1 = [], time.time()
+        while time.time() - t1 < 2.5:
+            labels = [label(r) for r in _cards()]
+            if labels:
+                break
+            time.sleep(0.3)
+        a11y("input", "key", "back")
+        if not titles:
+            # 账本空不等于屏幕上没东西——必须看一眼再说话
+            # 面板只数得到"带 × 的卡"；最后一张标签没有 ×（浏览器不允许关最后一个），数不到。
+            extra = "（最后一张标签没有 ×，不在这个数里）" if not labels else ""
+            print(f"剩 0 个（我没有记录）；面板里现有 {len(labels)} 张卡{extra}，都不是我开的，未动")
+            return
+        left = [t for t in titles if any(t[:12] in l for l in labels)]
+        print(f"剩 {len(left)} 个" + ("：" + "；".join(x[:20] for x in left) if left else "")
+              + f"（面板共 {len(labels)} 张卡）")
+        if left:
+            sys.exit(3)
+        return
+    if a.op == "clean":
+        titles = session_titles()
+        if not titles:
+            print("… 这次没开过标签")
+            return
+        r = close_verified(titles)
+        if r["status"] in ("env", "noview"):
+            die("没法清：前台不是浏览器或打不开标签管理", "先 bw go <url>，再 bw tabs clean", code=3)
+        prune_state(list(r["closed"]), r["remaining"], r.get("unseen", ()),
+                    inspected=r["status"] in ("ok", "partial"))
+        print(f"{'✔ 清掉并核实' if r['closed'] else '… 没有需要关的'} {len(r['closed'])} 个标签"
+              + ("：" + "；".join(x[:24] for x in dict.fromkeys(r["closed"])) if r["closed"] else ""))
+        if r["remaining"]:
+            print(f"  还剩 {len(r['remaining'])} 个没关掉，记录已保留")
+            sys.exit(3)
+        a11y("input", "key", "back")
+        return
+    return switch_tab(a.op)
+
+def dismiss_dialog():
+    """收尾时先把自己惹出来的弹窗关掉（下载确认、权限询问这类）。"""
+    nodes = dump()
+    w = flag(nodes)
+    if "弹窗" not in w and "下载" not in w:
+        return ""
+    for word in ("取消", "关闭", "以后再说", "不允许"):
+        n = next((x for x in web_nodes(nodes) if label(x) == word and x.get("clickable")), None)
+        if n:
+            tap_node(n)
+            time.sleep(0.4)
+            return word
+    return ""
+
+def cmd_close(a):
+    titles = session_titles()
+    if not titles:
+        # 没有要关的也要复位拟人，并且说话（原来静默只剩一行耗时，看着像没执行）
+        human_set(False)
+        print("✔ 没有我开的标签要关；拟人已复位")
+    if not a.keep_tabs and titles:
+        n0 = len(titles)
+        r = close_verified(titles)
+        if r["status"] == "env":
+            if a.home:
+                a11y("input", "key", "home")
+            print(f"✘ 一个都没关：浏览器不在前台（现在前台={front()}，需要 {PKG}）")
+            print(f"  pending={n0}  closed=0  记录没动，随时可以重跑")
+            print("  下一步：手动点开 X 浏览器再说\"关掉\"；或 bw go <url> && bw close")
+            sys.exit(3)
+        if r["status"] == "dry":
+            print(f"… 只做了核对，没有关任何标签（关闭动作在真机验收前被禁用）")
+            print(f"  面板里现有 {r['before']} 张卡；记账 {n0} 条")
+            print("  说明：× 的可点区域还没测准，之前点错会反而打开标签；确认后再开 CLOSE_VERIFIED_OK")
+            sys.exit(3)
+        if r["status"] == "changed":
+            print(f"✘ 面板数量异常变化，本次不判定成功（已关 {len(r['closed'])} 个，记录保留）")
+            print(f"  before={r['before']} after={r['after']} closed={len(r['closed'])} drift={r['drift']}")
+            print("  说明：这中间有别的动作在同时开/关标签（你也在用手机，或弹窗/动画）。我没法确认哪个是我的。")
+            print("  下一步：等手放下再说一次 bw close；或 bw tabs verify 只看不关")
+            sys.exit(3)
+        if r["status"] == "noview":
+            print(f"✘ 一个都没关：打不开标签管理（点了\"打开的标签\"没进到卡片列表）")
+            print(f"  pending={n0}  closed=0  卡片=0  记录没动")
+            print("  下一步：手动点一下地址栏旁的标签数，再跑 bw close")
+            sys.exit(3)
+        dropped = prune_state(list(r["closed"]), r["remaining"], r.get("unseen", ()),
+                              inspected=r["status"] in ("ok", "partial"))
+        if not r["remaining"]:
+            if r["drift"] is not None and r["before"] is not None and r["after"] is not None \
+                    and (r["after"] > r["before"] or abs(r["drift"]) > 1):
+                print(f"✘ 数字对不上（before={r['before']} after={r['after']} closed={len(r['closed'])}），不判成功")
+                sys.exit(3)
+            if r["closed"]:
+                print(f"✔ 关掉并核实 {len(r['closed'])} 个标签："
+                      + "；".join(x[:24] for x in dict.fromkeys(r["closed"])))
+                print(f"  before={r['before']} after={r['after']}（面板里少了 {r['before'] - r['after']} 张）")
+            elif r.get("unseen"):
+                # 面板里数到了卡片，但没有一张对得上我的记账：不知道是用户关了还是改了标题。
+                # 记录**不清**（prune 会 tries+1，3 次才放弃），也别打 ✔。
+                print(f"… 面板里没有我要找的那 {len(r['unseen'])} 个（可能你已手动关掉，或标题变了）")
+                print(f"  记录保留、没清；连续 3 次都找不到才会放弃。before={r['before']} after={r['after']}")
+                sys.exit(3)
+            else:
+                print(f"✔ 这 {n0} 个已经不在面板里了（可能你手动关过），记录已清；本次没关任何东西")
+                print(f"  before={r['before']} after={r['after']}")
+            human_set(False)                 # 收尾就该收干净：拟人不该粘到下一次任务
+            if a.home:
+                a11y("input", "key", "home")
+            if r.get("unseen"):
+                print(f"  另有 {len(r['unseen'])} 条没在面板里找到（可能早已关掉或改了标题），记录已保留："
+                      + "；".join(x[:16] for x in r["unseen"][:4]))
+            if dropped:
+                print(f"  放弃 {len(dropped)} 条连续 3 次没关掉的记录：" + "；".join(x[:20] for x in dropped[:4]))
+            a11y("input", "key", "back")
+        else:
+            print(f"✘ 只核实关掉 {len(r['closed'])} 个")
+            if r["remaining"]:
+                print(f"  还在面板里 {len(r['remaining'])} 个：")
+                for t in r["remaining"][:6]:
+                    print(f"  · {t[:40] or '（空标题，认不出）'}")
+            if r.get("unseen"):
+                print(f"  找不到 {len(r['unseen'])} 个（可能已手动关掉，也可能加载中改了标题）：")
+                for t in r["unseen"][:6]:
+                    print(f"  · {t[:40] or '（空标题）'}")
+            print(f"  pending={len(r['remaining']) + len(r.get('unseen', []))}"
+                  f"  before={r['before']} after={r['after']}"
+                  f"  记录已保留（连续 3 次都这样才放弃）")
+            sys.exit(3)
+    if front() == PKG:
+        gone = dismiss_dialog()
+        if gone:
+            print(f"✔ 顺手关掉弹窗（点了“{gone}”）")
+    if a.home:
+        a11y("input", "key", "home")
+        time.sleep(0.6)                 # 给系统一点时间切，别让下一句读到旧前台
+        print("✔ 回桌面（浏览器留在后台，随时接着看）")
+
+def cmd_human(a):
+    if a.state == "off":
+        human_set(False)
+        print("✔ 拟人已关（之后的动作按正常速度）")
+        return
+    minutes = getattr(a, "minutes", None) or HUMAN_TTL // 60
+    human_set(True, minutes)
+    print(f"✔ 拟人已开 · 往后 {minutes} 分钟内一直生效（每次命令自动续期），bw close 或 bw human off 结束")
+
+def cmd_shot(a):
+    p = subprocess.run(["scr", "shot"], capture_output=True, text=True)
+    out = p.stdout.strip().splitlines()
+    path = next((l[5:] for l in out if l.startswith("shot ")), "")
+    if not path:
+        die("截图失败：" + p.stdout.strip()[:120])
+    print(f"shot {path}")
+    print(f"url  minis://workspace/shots/{os.path.basename(path)}")
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(prog="bw", add_help=True)
+    ap.add_argument("--human", action="store_true", help="拟人节奏（抖动/分段/停顿）")
+    ap.add_argument("-q", "--brief", action="store_true", help="只回一行结论，不贴正文（链式执行用）")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("fast"); p.add_argument("target", nargs="+")
+    p.add_argument("--max", type=int, default=3000); p.set_defaults(f=cmd_fast)
+
+    p = sub.add_parser("go"); p.add_argument("target", nargs="+")
+    p.add_argument("--new", dest="new", action="store_true", default=False)
+    p.add_argument("--reuse", dest="reuse", action="store_true")
+    p.add_argument("--fast", action="store_true")
+    p.add_argument("--max", type=int, default=1800); p.set_defaults(f=cmd_go)
+    p = sub.add_parser("read"); p.add_argument("--max", type=int, default=3000)
+    p.add_argument("-n", "--count", type=int, default=0)
+    p.add_argument("--up", action="store_true")
+    p.add_argument("--timeout", type=int, default=4000)
+    p.add_argument("--pause", action="store_true", help="拟人：读之前停一下（≤1.2s）")
+    p.set_defaults(f=cmd_read)
+    p = sub.add_parser("state"); p.set_defaults(f=cmd_state)
+    p = sub.add_parser("tap"); p.add_argument("target"); p.add_argument("--nth", type=int)
+    p.add_argument("--timeout", type=int, default=4000); p.add_argument("--max", type=int, default=1200)
+    p.set_defaults(f=cmd_tap)
+    p = sub.add_parser("type"); p.add_argument("text", nargs="+")
+    p.add_argument("--into"); p.add_argument("--submit", action="store_true")
+    p.add_argument("--timeout", type=int, default=6000); p.add_argument("--max", type=int, default=1200)
+    p.set_defaults(f=cmd_type)
+    p = sub.add_parser("key"); p.add_argument("name"); p.add_argument("--timeout", type=int, default=3000)
+    p.add_argument("--max", type=int, default=1200); p.set_defaults(f=cmd_key)
+    p = sub.add_parser("tabs"); p.add_argument("op", nargs="?")
+    p.add_argument("arg", nargs="?"); p.set_defaults(f=cmd_tabs)
+    p = sub.add_parser("close"); p.add_argument("--keep-tabs", action="store_true")
+    p.add_argument("--home", action="store_true", help="关完回桌面（默认不回：本机 Minis 进后台后无法再拉起浏览器）")
+    p.set_defaults(f=cmd_close)
+    p = sub.add_parser("find"); p.add_argument("query", nargs="+")
+    p.add_argument("-n", type=int, default=1); p.add_argument("--site")
+    p.add_argument("--fast", action="store_true")
+    p.add_argument("--timeout", type=int, default=6000); p.add_argument("--max", type=int, default=2000)
+    p.set_defaults(f=cmd_find)
+    p = sub.add_parser("human"); p.add_argument("state", nargs="?", default="on")
+    p.add_argument("--minutes", type=int, default=15); p.set_defaults(f=cmd_human)
+    p = sub.add_parser("shot"); p.set_defaults(f=cmd_shot)
+
+    a = ap.parse_args()
+    global HUMAN
+    if os.environ.get("BW_HUMAN", "").strip() == "0":
+        HUMAN = False                       # 硬关：连粘性状态也不认（原来会被 human_until 覆盖）
+    elif getattr(a, "human", False):
+        HUMAN = True
+    elif human_left() > 0 and a.f.__name__ != "cmd_human":
+        HUMAN = True                        # 粘性：说一次，往后整段都算
+    if HUMAN and a.f.__name__ != "cmd_human":
+        human_set(True)                     # 每次用都续期
+        print("· 拟人", end=" ", file=sys.stderr)
+    if getattr(a, "brief", False):
+        BRIEF[0] = True
+    if not hasattr(a, "f"):
+        ap.print_help()
+        return
+    # cmd_human 只改本地账本，不该因为前台不是浏览器就失败（2026-11-22 实测被拦过一次）。
+    if a.f.__name__ not in ("cmd_go", "cmd_close", "cmd_fast", "cmd_tabs", "cmd_human") and front() != PKG:
+        if not bring_front():
+            die("前台不是 X 浏览器，自动拉起也没成功", "先 bw go <url>；或手动点开 App")
+        print("（自动切到浏览器前台）")
+    a.f(a)
+    if not BRIEF[0]:
+        print(f"· 全程 {_proc_age_ms()}ms")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:      # 被 `| head` 截断时别甩 traceback（实测 2026-11-21）
+        os._exit(0)
