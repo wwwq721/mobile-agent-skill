@@ -1,7 +1,7 @@
 ---
 name: screen
 description: 把手机交给我时用这一套：`scr look` 一眼看全屏、`scr tap 文字` 点完当场验、`scr grid` 把桌面读成表。凡"帮我点/打开/看看屏幕上有什么/把这事做完"都先加载本技能。
-version: 2.1.0
+version: 2.4.0
 ---
 
 # 手机操控（scr）
@@ -41,6 +41,17 @@ scr do "open:哔哩哔哩" "tap:动画"   # 一串动作一次做完，中间只
 | `doctor` | 环境体检 | `--save` 把实测值写进 device.json |
 
 桌面专用的 `grid` / `drag` / `drag-into` **不在本文展开**：它们是单一场景（整理桌面），做法与限制见 `scenarios/desktop.md`。
+
+## 手势
+
+日常用 `scr swipe up|down|left|right`，够用就别碰底层。要自己发手势时：
+
+```bash
+android-a11y-cli gesture swipe 900 1400 300 1400 --duration 300
+android-a11y-cli gesture pinch 640 1386 --scale 0.5
+```
+
+拖动（`gesture drag`）是桌面专用，做法与坑见 `scenarios/desktop.md`。
 
 ## 怎么读输出
 
@@ -105,7 +116,7 @@ s7 ☐  智能充电模式 @936,575
 | 你要做的事 | 读 |
 |---|---|
 | 点按钮、填表、翻页、开 App、看屏幕 | 本文，够了 |
-| 读桌面布局、移动/整理图标、拖进文件夹 | `scenarios/desktop.md` |
+| 读桌面布局（格位/空位/小部件）、移动图标 | `scenarios/desktop.md`（找图标点图标用 `scr look` 就够） |
 | 想知道"某条限制怎么来的" | `references/实测记录.md`（关键证据，按结论分组） |
 | 换手机、重装、或隔很久回来接着改 | **`迁移.md`**（首次部署注意 / 换机顺序 / 改代码后必做） |
 | 改 grid 网格、缩放、前台包名 | `references/设备参数.md` |

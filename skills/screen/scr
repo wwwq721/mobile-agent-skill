@@ -30,7 +30,7 @@ EDITOR_HINTS = ("multiscreenshot", "screenshot", "hwscreenshot")
 
 # ---------- 设备档案（换机改这里 + 删 device.json） ----------
 DEVFILE = "/var/minis/skills/screen/device.json"
-# 本机：安卓 17 机型（4 列 6 行 + Dock），换机用 scr doctor --save 重测
+# 本机：Android 17 机型（4 列 6 行 + Dock），换机用 scr doctor --save 重测
 DEV_DEFAULT = {"w": 1280, "h": 2772, "scale": 0.5, "cols": 4, "rows": 6,
                "launcher": "com.miui.home",
                # 实测（look 报出的节点中心，列距 301、行距 326）：旧值 227/502/777/1052、
@@ -708,7 +708,7 @@ def cmd_look(a):
 def cmd_tap(a):
     items0, s0, pkg0, _ = snap()
     if re.fullmatch(r"s\d+", a.target):
-        why = look_stale(s0)
+        why = look_stale(s0, a.max_age)
         if why:
             print(f"✘ 不用 {a.target} 点：{why}。下面是最新一屏，用 sN 重新指或直接给文字：")
             print(render(items0))
@@ -1288,7 +1288,12 @@ def cmd_grid(a):
     cur, total = _page_of(raw_nodes())
     start_page = cur or 1
     total = total or a.pages or 5
-    _goto_page(d, 1, total)
+    if a.all or a.pages:                      # 盘点才翻页；默认只读当前页（快、且不扰动布局）
+        last = total if a.all else min(a.pages or total, total)
+        _goto_page(d, 1, total)
+        cur_page, end_page = 1, last
+    else:
+        cur_page, end_page = start_page, start_page
     pages = []
     while True:
         icons, wids = _icons_normal()
@@ -1299,7 +1304,7 @@ def cmd_grid(a):
                   "这一屏没暴露内容，等 1s 重试，或直接用 scr shot 看图")
             sys.exit(2)
         pages.append((p, icons, wids))
-        if p >= total or len(pages) > total + 1:
+        if p >= end_page or len(pages) > total + 1:
             break
         _swipe_page(d, +1)
         nxt, _t = _wait_page(p)
@@ -1307,7 +1312,8 @@ def cmd_grid(a):
             break
         if not _icons_normal()[0]:        # 翻页会把暴露状态打回原形，重暖一次
             _warm_desktop()
-    _goto_page(d, start_page, total)          # 扫完复位：每页格子坐标一样，停错页就会点错
+    if a.all or a.pages:
+        _goto_page(d, start_page, total)      # 翻过页才需复位；单页模式本来就没动
     lines = []
     for p, icons, wids in pages:
         table = {}
@@ -1347,74 +1353,108 @@ def _dump_sig():
     return sig(items) if len(items) >= 3 else None
 
 
-def _drag_a11y_continue(x1, y1, x2, y2, ms):
-    """API 层的正解，需要 CLI 支持 --continue。
+def _gesture_drag(x1, y1, x2, y2, hold_ms=800, dur_ms=900, end_hold_ms=600):
+    """原生拖拽（1.16-beta.8+）：一根手指按下→按住→移动→落点按住→抬起。
 
-    Android 的 StrokeDescription 有 willContinue 标志，配 continueStroke() 可以做到
-    "这一段结束手指不抬起，下一段接着走"——正是"长按 → 拖动"要的东西。
-    但 android-a11y-cli 目前没暴露这个参数，所以先探一次：不认识就返回 None，退回抖动法。
+    返回 (ok, 说明)。旧版本没有这个子命令，会回 {"error": ...} 或非 0，调用方据此退回抖动法。
     """
-    hold = max(500, min(ms, 800))
-    r1 = a11y("gesture", "path", f"{x1},{y1}:{x1},{y1}", "--duration", str(hold), "--continue")
-    if not r1.get("ok"):
-        return None if (r1.get("error") or {}).get("code") == "INVALID_ARGS" else False
-    r2 = a11y("gesture", "path", f"{x1},{y1}:{x2},{y2}", "--duration", str(ms), "--continue")
-    return bool(r2.get("ok"))
+    r = a11y("gesture", "drag", str(x1), str(y1), str(x2), str(y2),
+             "--hold-ms", str(hold_ms), "--duration", str(dur_ms), "--end-hold-ms", str(end_hold_ms))
+    ok = bool(r.get("ok"))
+    d = r.get("data") or {}
+    return ok, f"holdMs={d.get('holdMs')} totalMs={d.get('totalMs')}"
 
+def _drag_a11y_jitter(x1, y1, x2, y2, hold_ms=2500, pick_ms=480, speed=300,
+                      edge=None, edge_ms=700):
+    """抖动法拖拽：一个连续过程，按下→按住→移动→落下，中间不抬手。
 
-# ⚠️ 拖拽这条线怎么继续做（2026-11-17 20:20 定论，别走回头路）
-#
-# 需要实现/修复拖拽时，**就用抖动方式**：起点附近做 ±5~6px 的来回（不超触摸阈值），
-# 多抖几次把"几何长度"攒出来，再走移动段。原因：`gesture path` 的 `--duration` 是按
-# **路径长度**均匀采样的（实测 A/B/C，见 references/实测记录.md 第八节），原地重复同一个坐标长度=0，
-# 换不来一毫秒"按住"——早期"重复点=按住"的写法等于没按住。
-#
-# 已知边界（别指望调参解决）：
-#   · 桌面：抖动法偶发成功（今天两次成功搬动、反向一次全无反应），不可复现；
-#   · 文件夹内：必败。长按会弹系统菜单，窗口切换让注入流被 cancel（GESTURE_FAILED）；
-#   · 真"按住再移动"要 willContinue + continueStroke，本 CLI 不暴露（--continue 直接 unknown option）。
-# 要真正做稳，只能换通道：Shizuku `input draganddrop` 或 root 逐条注入 motionevent。
+    `gesture path` 的 `--duration` 是**按路径几何长度均分**给每个点的，不是按点数。
+    这条事实决定了所有参数怎么算：
 
+      ①拿起 pick_ms（默认 480）：±3px 方波。实测长按阈值 450–500ms，
+         <450ms 图标没拿起、整段位移被桌面当成下滑（弹搜索）或翻页；
+         >550ms 才开始动会先弹应用菜单。
+      ②移动 按 speed 走（默认 300px/s ≈ 12.6px/点）。太快会被判甩动，落点变"插入"。
+      ③落点悬停 hold_ms：原地抖动。停死等于松手，必须一直微动。
+      ④抬手前继续微动，落点才不飘。
 
-def _drag_a11y_jitter(x1, y1, x2, y2, hold_ms=800, pick_ms=900, speed=500):
-    """抖动法拖拽：**一个连续过程，按下→按住→移动→落下，中间不停手、不抬手。**
-
-    `gesture path` 只收一个总时长，**按路径几何长度均分**（2026-11-17 实测，原"按点数"判断是错的），
-    所以重复点不占时间，塞一堆重复坐标换不来"按住"；要按住得让路径在触摸阈值内来回攒长度。
-    每点 42ms（本机实测最稳）。
-
-      ①拿起 pick_ms（默认 900）  ±3px 方波——测得低于 700ms 拿不起、高于 1100ms 变应用菜单
-      ②移动 按 speed 走         每点约 speed*42/1000 px（500px/s → 21px/点）。
-                                 旧版每点 123px≈2900px/s，是人的 7 倍，会被判成甩动
-      ③落点悬停 hold_ms（默认 800）原地抖动，不能停死（停死等于松手）
-      ④抬起前一瞬继续微动，抬手时手指仍在动，落点才不飘
+    edge="l"/"r"：跨页路径——拿起 → 拖到屏幕左/右边缘停 edge_ms 等翻页 → 再走到落点。
+    跨页只能一次注入做完（a11y 没有"按住不放跨越两次调用"的能力）。
     """
     MSPP = 42
-    box = 3        # ±3px：留在触摸阈值内，避免被当成滑页
+    box = 3        # ±3px：留在触摸阈值内
 
     def shiver(x, y, n):
         return [(x + (box if i % 2 else -box), y + (box if (i // 2) % 2 else -box))
                 for i in range(n)]
 
+    W, _H = screen_size()
     dist = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
-    step = max(8, speed * MSPP / 1000.0)          # 每点位移（px）
-    n_pick = max(2, int(pick_ms / MSPP))
-    n_move = max(2, int(dist / step))
-    n_hold = max(2, int(hold_ms / MSPP))
+    step = max(8, speed * MSPP / 1000.0)
     n_settle = 6
-    total = (n_pick + n_move + n_hold + n_settle) * MSPP
-    if total > 5200:                              # 实测 ≥5.9s 被系统取消（path cancelled），安全上限取 5.2s
-        n_hold = max(2, int((5200 - (n_pick + n_move + n_settle) * MSPP) / MSPP))
-        total = (n_pick + n_move + n_hold + n_settle) * MSPP
+    BUDGET = 5200      # 实测系统在 5.9–6.2s 取消整条 path
+    n_hold = max(4, int(hold_ms / MSPP))
+
+    if edge:
+        fast = step * 6                      # 跨页段长，不提速会顶到取消阈值
+        # 别贴到 18px：两侧是返回手势区，指尖在里面拖会被当成"返回"。70px 在图标列之外。
+        ex = 70 if edge == "l" else W - 70
+        sx = x1 + (120 if ex > x1 else -120)
+        n_seg1 = max(2, int(abs(sx - x1) / step))
+        n_seg2 = max(2, int(abs(ex - sx) / fast))
+        n_edge = max(4, int(edge_ms / MSPP))
+        n_move = max(2, int(abs(x2 - ex) / fast))
+        n_other = n_seg1 + n_seg2 + n_edge + n_move + n_hold + n_settle
+        lo = abs(sx - x1) + abs(ex - sx) + abs(x2 - ex) + 3 * (n_edge + n_hold + n_settle)
+    else:
+        n_move = max(2, int(dist / step))
+        n_other = n_move + n_hold + n_settle
+        lo = dist + 3 * (n_hold + n_settle)
+
+    # 核心修正：pick 段的点数必须按"整条路径长度"反算。
+    # 固定 11 点抖动在页内只值约 430ms（勉强够），跨页长路径下只值约 90ms——
+    # 于是整段被当成滑动，图标没拿起、桌面却翻了一页。二分求点数，让这一段刚好值 pick_ms。
+    def pick_span(k):
+        lp = k * 2 * box
+        return lp / (lp + lo) * (k + n_other) * MSPP
+
+    lo_k, hi_k = 2, 400
+    while lo_k < hi_k:
+        mid = (lo_k + hi_k) // 2
+        if pick_span(mid) < pick_ms:
+            lo_k = mid + 1
+        else:
+            hi_k = mid
+    n_pick = lo_k
+
+    total = (n_pick + n_other) * MSPP
+    if total > BUDGET:                       # 超预算先砍悬停，给落点留 6 点微动
+        cut = min(n_hold - 6, (total - BUDGET) // MSPP)
+        if cut > 0:
+            n_hold -= cut
+            n_other -= cut
+            total = (n_pick + n_other) * MSPP
+
     pts = shiver(x1, y1, n_pick)
-    pts += [(round(x1 + (x2 - x1) * i / n_move), round(y1 + (y2 - y1) * i / n_move))
-            for i in range(1, n_move + 1)]
+    if edge:
+        pts += [(round(x1 + (sx - x1) * i / n_seg1), y1) for i in range(1, n_seg1 + 1)]
+        pts += [(round(sx + (ex - sx) * i / n_seg2), y1) for i in range(1, n_seg2 + 1)]
+        # 贴边"推"：原地 ±3px 会被当成手指停住，翻页不触发；在内侧 12px 来回推进才认。
+        pts += [(ex - (12 if k % 2 else 0), y1 + (2 if k % 4 < 2 else -2))
+                for k in range(n_edge)]
+        pts += [(round(ex + (x2 - ex) * i / n_move), round(y1 + (y2 - y1) * i / n_move))
+                for i in range(1, n_move + 1)]
+    else:
+        pts += [(round(x1 + (x2 - x1) * i / n_move), round(y1 + (y2 - y1) * i / n_move))
+                for i in range(1, n_move + 1)]
     pts += shiver(x2, y2, n_hold)
     pts += shiver(x2, y2, n_settle)
     path = ":".join(f"{px},{py}" for px, py in pts)
     r = a11y("gesture", "path", path, "--duration", str(total))
+    if os.environ.get("SCR_DRAG_DEBUG"):
+        print(f"  [drag] pick={n_pick}点≈{pick_span(n_pick):.0f}ms move={n_move} "
+              f"hold={n_hold} edge={n_edge if edge else 0} total={total}ms", file=sys.stderr)
     return bool(r.get("ok"))
-
 
 def _order_cells(icons):
     """当前页按阅读顺序（行优先）排好的格子 [(name, row, col, x, y)]。"""
@@ -1427,16 +1467,15 @@ def _order_cells(icons):
     return out
 
 def cmd_drag_into(a):
-    """把图标拖进文件夹/格子：**落点按"抬起后"的布局算**，不是按拖之前。
+    """把图标拖到指定格子（文件夹就按格子指，它没有名字）。
 
-    为什么必须补偿（2026-11-18 实测定论）：图标一被拿起就跟着手指走，原格空出，
-    MIUI 立刻把后面的图标回填一格 —— 目标文件夹会往前移一位，手指底下已经不是它。
-    所以：目标在阅读顺序上位于起点之后时，落点要取"它前移一格后"的格子中心。
+    **落点默认按"拖之前"的格子中心，不做回填补偿**（--shift 才补偿）。
+    2026-11-26 实测：拖到文件夹原位时，有时合并、有时被挤成插入，说明"补偿/不补偿"
+    两种简单规则都不足以解释 launcher 的行为；先按格心落，再读结果判断，别预先补偿。
 
-    另外落点是**图标中心**要压住格子中心，不是手指坐标；两者默认按同一位置处理
-    （MIUI 图标跟指尖居中），实测有偏差时用 --grab-dx/--grab-dy 修。
+    落点用格子中心（=图标中心）。指尖与图标中心的偏差用 --grab-dx/--grab-dy 修。
 
-    用法：scr drag-into "咪咕音乐" r6c1 [--grab-dx 0 --grab-dy -20]
+    用法：scr drag-into "某个 App" r6c1 [--grab-dx 0 --grab-dy -20]
     """
     import re as _re
     if not _warm_desktop():
@@ -1455,6 +1494,7 @@ def cmd_drag_into(a):
         print(f"✘ “{a.src}” 命中 {len(hits)} 个（{'、'.join(f'r{c[1]}c{c[2]}' for c in hits)}）：说全名")
         sys.exit(1)
     src = hits[0]
+    cells_src_name = src[0]
     m = _re.fullmatch(r"[rR](\d)[cC](\d)", a.dst)
     if not m:
         print("✘ 目标要给格子，如 r3c1（文件夹在无障碍里没有文字，只能按格子指）")
@@ -1477,36 +1517,87 @@ def cmd_drag_into(a):
         real = cells[idx_dst + 1]
         print(f"… 起点在目标之后：{a.dst} 不动，落点取 r{real[1]}c{real[2]}（后一位）")
         tr, tc = real[1], real[2]
-    x1, y1 = src[3], src[4]
-    x2 = d["grid_x"][tc - 1] + a.grab_dx
-    y2 = d["grid_y"][tr - 1] + a.grab_dy
-    print(f"… 拖 “{src[0]}” r{src[1]}c{src[2]} → 落点 r{tr}c{tc} ({x2},{y2})")
+    cols_n = len(d["grid_x"])
+
+    def _idx(r, c):
+        return (r - 1) * cols_n + (c - 1)
+
+    def _drop(ax, ay, bx, by):
+        ok, _det = _gesture_drag(ax, ay, bx, by, hold_ms=a.pick, dur_ms=900, end_hold_ms=a.hold)
+        if not ok:
+            print("… 原生 gesture drag 不可用，退回抖动兜底")
+            ok = _drag_a11y_jitter(ax, ay, bx, by, a.hold, a.pick, a.speed)
+        time.sleep(1.0)
+        return ok
+
+    def _reread():
+        best = []
+        for _ in range(3):
+            _warm_desktop()
+            cur = _icons_normal()[0]
+            if len(cur) > len(best):
+                best = cur
+            time.sleep(0.4)
+        return _order_cells(best)
+
+    def _anchor(r, c):
+        return (d["grid_x"][c - 1] + a.grab_dx, d["grid_y"][r - 1] + a.grab_dy)
+
+    cur_page = _page_of(raw_nodes())[0]
+    j = _idx(tr, tc)
+    occupied = {_idx(c[1], c[2]) for c in cells}
+
+    # 规范化：源在目标之前时，"插入位"会抢在合并前——先把图标搬到目标之后的空格，再按"源在后"落
+    if _idx(src[1], src[2]) < j:
+        holes = [k for k in sorted(occupied.symmetric_difference(range(_idx(1, 1), _idx(d["rows"], cols_n) + 1)))
+                 if k > j]
+        if holes:
+            hr, hc = divmod(holes[0], cols_n)
+            hr, hc = hr + 1, hc + 1
+            print(f"… 源在目标之前：先落到 r{hr}c{hc}（目标之后的空格），再合进去")
+            _drop(src[3], src[4], *_anchor(hr, hc))
+            cells = _reread()
+            src = next((c for c in cells if c[0] == cells_src_name), None) or \
+                  next((c for c in cells if c[0] == src[0]), None)
+            if not src:
+                print("✘ 规范化这一步后找不到被拖图标：先 scr grid 看现状，别重跑")
+                sys.exit(1)
+        else:
+            print("… 目标之后没有空格：直接落（可能变成插入，落完会核）")
+
     pre = len(cells)
-    ok = _drag_a11y_jitter(x1, y1, x2, y2, a.hold, a.pick, a.speed)
-    time.sleep(1.0)
-    post = []
-    for _ in range(3):                       # 预热后图标只会暴露很短时间，多读几次取最多的那次
-        _warm_desktop()
-        cur = _icons_normal()[0]
-        if len(cur) > len(post):
-            post = cur
-        if len(post) >= pre - 1:
-            break
-        time.sleep(0.6)
-    names_after = [c[0] for c in _order_cells(post)]
-    if len(post) == pre - 1 and src[0] not in names_after:
-        print(f"✔ 已并入 r{tr}c{tc}：页面 {pre} → {len(post)} 项，被拖图标已不在桌面（手势 {'ok' if ok else '注入未确认'}）")
+    x2, y2 = _anchor(tr, tc)
+    print(f"… 拖 “{src[0]}” r{src[1]}c{src[2]} → 落点 r{tr}c{tc} ({x2},{y2}) · 第 {cur_page or '?'} 页")
+    ok = _drop(src[3], src[4], x2, y2)
+    post = _reread()
+    still = [c for c in post if c[0] == src[0]]
+    folder_there = any(c[0] == "(文件夹)" and (c[1], c[2]) == (tr, tc) for c in post)
+    inside = None
+    if not still and folder_there:                # 图标离桌且目标格仍是文件夹 → 开进去核对
+        a11y("tap", "xy", str(x2), str(y2))
+        time.sleep(1.3)
+        inside = '"found":true' in a11y("scroll", "to-text", src[0])
+        a11y("input", "key", "back")
+        time.sleep(0.9)
+    if inside:
+        print(f"✔ 已并入 r{tr}c{tc}：“{src[0]}”在文件夹内可见，页面 {pre} → {len(post)} 项")
         return
-    left = f"仍在 r{_cell(*next((c for c in _order_cells(post) if c[0] == src[0]), (0,0,0,0))[3:5])}" if src[0] in names_after else "已不在桌面"
-    print(f"✘ 没并进去：“{src[0]}” {left}；页面 {pre} → {len(post)} 项")
-    print("  下一次先看 scr look 的实际情况再决定，别直接重跑")
+    where = (f"r{still[0][1]}c{still[0][2]}" if still else "已不在桌面")
+    print(f"✘ 没并进去：“{src[0]}” {where}；页面 {pre} → {len(post)} 项；"
+          f"目标格{'仍是文件夹' if folder_there else '已不是文件夹（被挤走=插入）'}")
+    if not folder_there and a.rollback:
+        back = next((c for c in cells if c[0] == src[0]), None)
+        if back:
+            print(f"… 回滚：把 “{src[0]}” 从 {where} 拖回原格 r{back[1]}c{back[2]}")
+            _drop(still[0][3], still[0][4], *_anchor(back[1], back[2])) if still else None
+    print("  下一次先 scr grid 看实际情况再决定，别直接重跑")
     sys.exit(1)
 
 def cmd_drag(a):
     """把 (x1,y1) 的图标长按拖到 (x2,y2)，拖完给结论。
 
-    backend=auto：先 shizuku（唯一能把"按下-停住-拖动-抬起"一次做完的通道），
-    不行再退 a11y 抖动（HyperOS 3 上多半不通，见 SKILL.md 的实测结论）。
+    默认走原生 `gesture drag`（1.16-beta.8+，一根手指按下→按住→移动→落点按住→抬起）；
+    老版本没有该子命令时才退回抖动法（--backend a11y 可强制走它）。
     """
     if a.on_desktop:
         pkg0 = info().get("packageName", "")
@@ -1528,23 +1619,20 @@ def cmd_drag(a):
     if pre_sig is None:
         pre_shot, _e = shot()
     used, ok, detail = None, False, ""
-    if a.backend in ("auto", "shizuku"):
-        r = subprocess.run(["android-shizuku-cli", "exec",
-                            f"input draganddrop {x1} {y1} {x2} {y2} {a.ms}"],
-                           capture_output=True, text=True)
-        ok = r.returncode == 0 and '"ok":true' in (r.stdout or "")
-        used, detail = "shizuku", (r.stdout or r.stderr).strip()[:120]
-        if not ok and a.backend == "auto":
-            print(f"… shizuku 不可用：{detail}")
-    if not ok and a.backend in ("auto", "a11y"):
-        cont = _drag_a11y_continue(x1, y1, x2, y2, a.ms)
-        if cont:
-            ok, used, detail = True, "a11y-continue", "continueStroke：手指不抬起"
+    if a.backend != "a11y":
+        ok, gdetail = _gesture_drag(x1, y1, x2, y2, hold_ms=a.pick, dur_ms=max(200, a.ms),
+                                    end_hold_ms=a.hold)
+        if ok:
+            used, detail = "a11y-drag", gdetail
+        elif a.backend == "drag":
+            print("✘ 本机 android-a11y-cli 不支持 gesture drag（需 1.16-beta.8+）："
+                  "升级 app，或用 --backend a11y 走抖动兜底")
+            sys.exit(2)
         else:
-            if cont is None:
-                print("… CLI 不支持 --continue（continueStroke），退回抖动法")
-            ok = _drag_a11y_jitter(x1, y1, x2, y2, a.hold, a.pick, a.speed)
-            used, detail = "a11y-jitter", ""
+            print("… 原生 gesture drag 不可用，退回抖动兜底")
+    if not ok:
+        ok = _drag_a11y_jitter(x1, y1, x2, y2, a.hold, a.pick, a.speed, a.edge, a.edge_ms)
+        used, detail = "a11y-jitter", ""
     time.sleep(0.8)
     if pre_sig is not None:                      # 有节点：按结构比，最硬
         post = _dump_sig()
@@ -1553,10 +1641,19 @@ def cmd_drag(a):
     else:                                        # 桌面没图标节点，只能看像素
         post_shot, _e = shot()
         d = diff(post_shot, pre_shot) if (post_shot and pre_shot) else None
-        changed = d is not None and d > 0.5      # 0.5%：搬一个图标实测 1–8%，动画/模糊也能到 0.1%
+        # 实测（本机 640×1386 小图）：搬动一个图标，整屏差 0.3–1.2%——**小变化才是成功**；
+        # 界面被切走（下拉搜索、换页、弹菜单）反而 >15%。旧版用"差 >0.5% 才算动"，
+        # 把 0.5% 的真实搬动判成失败，方向正好反了。
+        changed = d is not None and d > 0.15
+        if d is not None and d > 15:
+            print(f"⚠ 像素差 {d}%：整屏都变了，多半没拿起（整段位移被当成下滑/翻页/长按菜单）")
         basis = f"像素差 {d}%" if d is not None else "像素差取不到"
     post_page = _page_of(raw_nodes())[0]
-    flipped = bool(pre_page and post_page and pre_page != post_page)
+    if a.edge and pre_page and post_page and pre_page == post_page:
+        print(f"⚠ 边缘停留没触发翻页（仍停在第 {post_page} 页）：加大 --hold（跨页悬停），"
+              "或确认 --edge 方向和目标页的相对位置")
+    # 跨页拖拽本来就要翻页，别把"页面变了"当成"没拿起"
+    flipped = bool(pre_page and post_page and pre_page != post_page) and not a.edge
     if flipped:                                # 拿起失败时，剩下的位移被桌面当成翻页
         print(f"✘ 没拿起，变成了翻页：桌面 {pre_page} → {post_page} 页（via {used}）")
         print("  下一步：先把桌面翻回去；拖拽见 SKILL.md 的通道限制说明")
@@ -1565,7 +1662,7 @@ def cmd_drag(a):
     print(f"{mark} drag {x1},{y1} → {x2},{y2} via {used} · "
           f"{'位置变了' if changed else '未确认（不代表没动）'} · 依据 {basis}（耗时 {a.ms}ms）")
     if not changed:
-        print("  下一步：scr grid 看实际落点；或换 backend=shizuku / 手动")
+        print("  下一步：scr grid 看实际落点；跨页可加大 --hold（边缘悬停时长）")
         sys.exit(1)
 
 
@@ -1680,6 +1777,11 @@ def cmd_doctor(a):
         not (len(items) >= 3 and len(raw_click) < 3),
         "清单 <3 但其实有可点节点 = 假像素模式，白花一次截图")
 
+    # 3.5) 手势能力（1.16-beta.8 才有原生 drag；没有就得靠 a11y 兜底）
+    g = a11y("gesture", "drag", "1", "1", "2", "2", "--hold-ms", "0", "--duration", "100", "--end-hold-ms", "0")
+    add("原生drag", "gesture drag 可用" if g.get("ok") else "不可用（需 1.16-beta.8+，只能 --backend a11y）",
+        bool(g.get("ok")), "升级 Minis app；老版本用 scr drag --backend a11y 走抖动兜底")
+
     # 4) 桌面
     if pkg == d["launcher"]:
         add("桌面节点", f"普通态 {len(items)} 项（HyperOS 通常为 0，靠 grid/截图）", True)
@@ -1744,6 +1846,7 @@ def main():
     p = sub.add_parser("tap")
     p.add_argument("target"); p.add_argument("--nth", type=int, default=None)
     p.add_argument("--expect", default=""); p.add_argument("--timeout", type=int, default=1500)
+    p.add_argument("--max-age", type=int, default=180, help="sN 引用的有效期秒数，默认 180（屏一变即作废）")
     p.set_defaults(f=cmd_tap)
 
     p = sub.add_parser("xy")
@@ -1776,28 +1879,32 @@ def main():
 
     p = sub.add_parser("grid")
     p.add_argument("--json", default=None, help="把整份布局写到这个文件")
-    p.add_argument("--pages", type=int, default=None, help="页数读不到时用这个值")
+    p.add_argument("--pages", type=int, default=None, help="读第 1..N 页（盘点用）；不给则只读当前页")
+    p.add_argument("--all", action="store_true", help="读全部页")
     p.set_defaults(f=cmd_grid)
 
     p = sub.add_parser("drag-into", help="拖进文件夹/格子（落点按抬起后布局补偿）")
     p.add_argument("src", help="被拖图标的名字")
     p.add_argument("dst", help="目标格子，如 r3c1")
     p.add_argument("--shift", action="store_true", help="启用回填补偿（默认关闭，实测不需要）")
+    p.add_argument("--rollback", action="store_true", help="失败且目标被挤走时，自动把图标拖回原格")
     p.add_argument("--grab-dx", type=int, default=0, help="落点 x 修正（图标中心 vs 指尖）")
     p.add_argument("--grab-dy", type=int, default=0, help="落点 y 修正")
     p.add_argument("--hold", type=int, default=1500)
-    p.add_argument("--pick", type=int, default=420)
+    p.add_argument("--pick", type=int, default=480)
     p.add_argument("--speed", type=int, default=300, help="移动速度，默认 300（500 易被判甩动→插入）")
     p.set_defaults(f=cmd_drag_into)
 
     p = sub.add_parser("drag")
     p.add_argument("x1"); p.add_argument("y1"); p.add_argument("x2"); p.add_argument("y2")
-    p.add_argument("--hold", type=int, default=3500, help="落点悬停毫秒数，默认 3500（<1s 实测判失败，要够久才出合并预览）")
-    p.add_argument("--pick", type=int, default=420, help="拿起时长毫秒数，默认 420（>500 变长按弹菜单）")
+    p.add_argument("--hold", type=int, default=2500, help="落点悬停毫秒：页内合并建议 2000–2500；跨页把它当边缘悬停用（1.5s≈翻1页、1.6s≈翻2页）")
+    p.add_argument("--pick", type=int, default=480, help='拿起时长毫秒数，默认 480：实测长按阈值 450–500ms，压到 420 常常没拿起、整段位移被当成桌面下滑；>550 才弹应用菜单')
     p.add_argument("--speed", type=int, default=300, help="移动速度 px/s，默认 300（500 判甩动→插入）")
     p.add_argument("--scale", type=float, default=1, help="给的是截图坐标就写 2")
-    p.add_argument("--ms", type=int, default=800, help="按住到落下的总时长")
-    p.add_argument("--backend", choices=["auto", "shizuku", "a11y"], default="auto")
+    p.add_argument("--ms", type=int, default=800, help="移动段时长（按住段用 --pick、落点段用 --hold）")
+    p.add_argument("--edge", choices=["l", "r"], help="仅 --backend a11y：先拖到左/右边缘等翻页再走落点；r=下一页，l=上一页")
+    p.add_argument("--edge-ms", type=int, default=1500, help="仅 --backend a11y：边缘停留毫秒，默认 1500（约一页）")
+    p.add_argument("--backend", choices=["drag", "auto", "a11y"], default="drag", help="drag=原生(默认)；a11y=强制抖动兜底")
     p.add_argument("--force", action="store_true", help="允许从顶部死区起手（长按抢得过系统手势时）")
     p.add_argument("--on-desktop", dest="on_desktop", action="store_true",
                    help="先断言前台是桌面，否则拒绝执行（防止手势打到别的 App 上）")

@@ -24,6 +24,9 @@
 
 用法见 SKILL.md。这里是实现。
 """
+import contextlib
+import fcntl
+import functools
 import json
 import os
 import random
@@ -91,7 +94,7 @@ def dump():
         if e.get("code") == "SERVICE_NOT_RUNNING":
             die("无障碍没开", "让用户去 设置→无障碍 打开 Minis")
         die(f"dump 失败 {e.get('code')} {e.get('message','')}")
-    nodes = d["data"]["nodes"]
+    nodes = (d.get("data") or {}).get("nodes") or []
     _measure(nodes)
     return nodes
 
@@ -119,7 +122,8 @@ def _measure(nodes):
           if b.get("right", 0) - b.get("left", 0) > 0.55 * W
           and 90 <= b.get("bottom", 0) - b.get("top", 0) <= 190 and b.get("top", 9e9) < 0.25 * H]
     TOP = min(ab) if ab else int(0.10 * H)
-    _GEOM["done"] = True
+    if sum(1 for n in nodes if n.get("packageName") == PKG) >= 5:
+        _GEOM["done"] = True                    # 首帧若是状态栏/别的 App，量出来的尺寸是错的，下次重建
 
 def _open(args, t=15):
     """android-open 一律带超时：熄屏或系统卡住时它会挂住，调用方等不到任何返回。"""
@@ -167,6 +171,9 @@ def page_items(nodes):
     for n in web_nodes(nodes):
         t = re.sub(r"\s*Translate this result$", "", label(n))
         if not t or CHROME.match(t):
+            continue
+        # 内联 SVG/图片的 data URI 会当成"正文"打出来（实测一次 7000 字全是 svg 路径），直接丢
+        if t.startswith("svg+xml") or "%3Csvg" in t[:40] or (len(t) > 1200 and re.match(r"^[a-z]+/[a-z0-9+.]+;", t)):
             continue
         b = n["bounds"]
         k = (t, b["top"] // 6)
@@ -350,15 +357,48 @@ def load_state():
 
 HUMAN_TTL = 900          # 15 分钟没用就自动失效，别污染下次任务
 
+_LOCK = {"fd": None, "depth": 0}
+
+@contextlib.contextmanager
+def state_lock():
+    """会话间互斥：同一时刻只允许一个进程改账本（可重入）。
+    实测后果（2026-11-23）：两进程各 note_tab 25 次 → FileNotFoundError 崩在写临时文件；
+    不崩时后写者赢，前面的记录整批丢失。"""
+    if _LOCK["depth"] == 0:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        fd = os.open(STATE + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _LOCK["fd"] = fd
+    _LOCK["depth"] += 1
+    try:
+        yield
+    finally:
+        _LOCK["depth"] -= 1
+        if _LOCK["depth"] == 0:
+            try:
+                fcntl.flock(_LOCK["fd"], fcntl.LOCK_UN)
+            finally:
+                os.close(_LOCK["fd"])
+                _LOCK["fd"] = None
+
+def with_lock(fn):
+    """给"读—改—写"整段加锁；可重入，所以 note_tab 被 retitle_active 调用也没问题。"""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        with state_lock():
+            return fn(*a, **k)
+    return wrapper
+
 def save_state(st):
     """原子写：先写 .tmp 再 replace。
     半截 JSON 会被 load_state 当成空账，而空账的后果是"开过的标签再也关不掉"——所以这一步不能省。"""
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    tmp = STATE + ".tmp"
+    tmp = f"{STATE}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump(st, f, ensure_ascii=False)
     os.replace(tmp, STATE)
 
+@with_lock
 def note_tab(title):
     """记一个"这是我开的标签"。active 指向它，后面它改名了还能认出来。"""
     st = load_state()
@@ -368,18 +408,21 @@ def note_tab(title):
     st["last"] = title
     save_state(st)
 
+@with_lock
 def rename_active(title):
     """复用同一个标签里跳了页：就地改名，而不是再追加一条。
     追加会在账本里堆出一串同一张卡的旧标题，后面每次 close 都要为它们逐个失败（2026-11-22 实测 1 张卡 4 条记录）。"""
     st = load_state()
     if not title:
         return
-    if st.get("active") is None or not st["tabs"]:
+    idx = st.get("active")
+    if idx is None or not st["tabs"] or not (0 <= idx < len(st["tabs"])):
         return note_tab(title)
-    st["tabs"][st["active"]]["title"] = title
+    st["tabs"][idx]["title"] = title
     st["last"] = title
     save_state(st)
 
+@with_lock
 def retitle_active(nodes):
     """在这个"我开的"标签里又跳了页：把新标题也记一笔。
     搜索结果常在新标签里打开，所以宁可按两个标题各关一次，也不漏关。"""
@@ -387,10 +430,12 @@ def retitle_active(nodes):
     title = bar_text(nodes)
     if st.get("active") is None or not title:
         return
-    if st["tabs"] and st["tabs"][-1]["title"] == title:
-        return
+    idx = st.get("active")
+    if idx is not None and 0 <= idx < len(st["tabs"]) and st["tabs"][idx]["title"] == title:
+        return                                   # 就是这条，不重复记
     note_tab(title)
 
+@with_lock
 def human_set(on, minutes=15):
     st = load_state()
     if on:
@@ -516,6 +561,7 @@ def via_bar(url):
         _bar_cleanup()
         return None, 0
     nodes = dump()
+    ms = 0                                # 三条提交路都没走通时也要能 return（2026-11-22 撞过 UnboundLocal）
     prev_title = prev[0] if isinstance(prev, tuple) else ""   # 打字前的页面标题
     if ime_up(nodes):                     # 地址栏的“前往”就是键盘右下角那颗
         # 三条路依次试：键盘 H-186（本机 Sogou）→ 地址栏右侧的“前往”箭头 → 键盘 H-100（旧机）。
@@ -596,7 +642,9 @@ def go(target, new_tab=True, human_dwell=True):
     """开页并记账。改这里必须连带改 note_tab/retitle_active：只记"确认落地"的。"""
     nodes, how, ms, note = _go_impl(target, new_tab=new_tab, human_dwell=human_dwell)
     title = bar_text(nodes) if nodes else ""
-    if title:
+    if nodes is not None and not title and how in ("地址栏", "新标签+地址栏", "intent"):
+        note_tab("")                            # 没标题也要记：否则这张卡永远关不掉
+    elif title:
         if new_tab:
             note_tab(title)                  # 新开的一页：一条记录
         elif how == "地址栏":
@@ -608,6 +656,14 @@ def go(target, new_tab=True, human_dwell=True):
 def _go_impl(target, new_tab=True, human_dwell=True):
     url = _url_of(" ".join(target) if isinstance(target, list) else target)
     nodes, ms, how, note = None, 0, "intent", ""
+    # 前提：**调用方在前台**，否则任何 startActivity 都会被系统拦。
+    # 前台既不是 Minis 也不是浏览器（桌面/别的 App）时，先把自己切回前台——这一步 a11y 随时能做。
+    if front() not in (MINIS, PKG):
+        bring_minis_front()
+    # 需要动浏览器界面（新建标签、地址栏）的分支，得先让浏览器在前台
+    needs_ui = (not new_tab) or (new_tab and bool(re.search(r"[#;]", url))) or bool(HUMAN and new_tab)
+    if needs_ui and front() != PKG:
+        bring_front()
     if HUMAN and new_tab and not re.search(r"[#;]", url):
         # 拟人：人在地址栏里打字再前往。慢，但屏幕上有"输入"这个过程。
         # new_tab=True 时必须**先开一张新标签**再打字：via_bar 改的是当前标签，
@@ -618,8 +674,17 @@ def _go_impl(target, new_tab=True, human_dwell=True):
                 return nodes, "地址栏", ms, "（拟人：新建标签后走地址栏）"
         nodes = None                            # 没走通就退回其他路径，别把任务卡死
         note = "（拟人：地址栏没走通，改用其他路径）"
-    if not new_tab or re.search(r"[#;]", url):
-        nodes, ms = via_bar(url)                    # intent 会截断锚点/分号参数
+    if new_tab and re.search(r"[#;]", url):
+        # intent 会截断 # 与 ;，只能走地址栏；但**必须先开一张新标签**，
+        # 否则改的是当前标签——用户正看着的那页会被顶掉（2026-11-23 审计）。
+        if open_new_tab():
+            nodes, ms = via_bar(url)
+            if nodes is not None:
+                return nodes, "新标签+地址栏", ms, "（URL 含 # 或 ;，新建标签后走地址栏）"
+            # 地址栏没走通：可以退回 intent，但**锚点会丢**，而且会再开一张页。这条必须在输出里说。
+            note = "（地址栏没走通，退回 intent：这一页的 # 锚点/; 参数保不住）"
+    elif not new_tab:
+        nodes, ms = via_bar(url)
         if nodes is not None:
             how = "地址栏"
             note = "（URL 含 # 或 ;，改走地址栏）" if new_tab else ""
@@ -795,6 +860,12 @@ def type_into(text, into=None):
             die("写不进输入框 " + str(r.get("error")))
         got = text
     nap(0.15, 0.35)
+    # 回读一次：写没写进去要看框里的值，不能只凭 setText 返回 ok（2026-11-23 审计要求）。
+    back = [n for n in web_nodes(dump()) if n.get("editable")]
+    vals = [ (n.get("text") or "") for n in back ]
+    if vals and not any(got in v or v.strip() == got.strip() for v in vals):
+        die(f"写不进输入框：框里现在是 {'/'.join(v[:12] or '空' for v in vals[:2])}",
+            "可能点到了别的框，或页面重绘把节点换了；bw shot 看一眼再试", code=3)
     return got, field
 
 def do_submit(field, into, timeout=7000):
@@ -849,6 +920,10 @@ def in_tabview(nodes=None):
 
 def open_tabview(wait=0.9, tries=3):
     """进标签面板，**看见"新建标签"才算进去了**。已经在面板里就直接返回 True。"""
+    # 键盘没收起来时，底栏被挡住，点"打开的标签"会打到键盘上（2026-11-22 实测）。
+    if ime_up():
+        a11y("input", "key", "back")
+        time.sleep(0.4)
     for _ in range(tries):
         nodes = dump()
         if in_tabview(nodes):
@@ -1085,7 +1160,9 @@ def close_verified(titles, max_taps=40):
         if ca[n] < max(0, expect):
             ghost.append(f"{n[:20]} 少 {max(0, expect) - ca[n]} 张")
     names = list(dict.fromkeys(titles))
-    still = [t for t in names if _row_of(after_rows, t) is not None and t not in closed]
+    _cc_tmp = _C(closed)
+    still = [t for t in names
+             if ca.get(t, 0) > 0 and _cc_tmp.get(t, 0) < cb.get(t, 0)]
     # 找不到 ≠ 已关掉：标签可能在加载中改了标题（实测见过 "Example Domain" → "请稍候…"），
     # 也可能真被手动关掉。分不清就如实分成两栏，别用"已不在"把记录擦掉。
     unseen = [t for t in names if t not in still and t not in closed]
@@ -1093,27 +1170,49 @@ def close_verified(titles, max_taps=40):
     drift = None if (before is None or after is None) else after - (before - len(closed))
     st = "ok" if not still and not unseen else "partial"
     # 只接受"正好少 len(closed) 张"；少了更多说明可能多关了，多了说明别人在开。
-    # 例外：关到 0 张时面板自动退出，计数不可靠，按 closed 认定。
-    suspicious = (drift is not None and drift != 0 and not (after == 0 and closed)) or bool(ghost)
+    # 两个例外：
+    #   ① 关到 0 张时面板自动退出，计数不可靠，按 closed 认定；
+    #   ② **关的是当前标签**时，浏览器会自动补一张空白页，卡片数不变（2026-11-22 实测 11→11）。
+    #      判据：多出来的那几张正好是空白/主页。
+    # 面板一屏只放得下十来张卡，再多就滚动：这时 before/after 天然不可靠，
+    # 只认"标题级核对"（_wait_less 已经逐个标题确认少了一张）。2026-11-22 实测 13 个标签只显示 11 张。
+    saturated = before is not None and before >= 10
+    blanks = ("主页", "新标签页", "搜索或网址", "")
+    n_blank = lambda ns: sum(1 for x in ns if x.strip() in blanks)      # noqa: E731
+    replaced = (drift is not None and drift > 0
+                and n_blank(after_names) - n_blank(before_names) >= drift)
+    note = ""
+    if saturated:
+        note = "（面板满屏，卡片数不可靠；已按标题逐张核对）"
+    elif replaced:
+        note = "（关的是当前标签，浏览器自动补了一张空白页，所以卡片数没少）"
+    suspicious = ((drift is not None and drift != 0 and not (after == 0 and closed)
+                   and not replaced and not saturated)
+                  or (bool(ghost) and not saturated))
     if suspicious:
         # 2026-11-19 实测踩到：before=5 关了 2 张，after=12（期间冒出 7 张）。
         # 面板数量对不上，说明有别的东西在同一时间开/关标签——这时任何 ✔ 都是猜的。
         st = "changed"
-    return {"status": st, "closed": closed, "remaining": still, "unseen": unseen,
+    return {"status": st, "closed": closed, "remaining": still, "unseen": unseen, "note": note,
             "before": before, "after": after, "drift": drift, "ghost": ghost}
 
-def prune_state(closed, remaining, unseen=(), inspected=True):
+@with_lock
+def prune_state(closed, remaining, unseen=(), inspected=True, keep=()):
     """只删"核实关掉"的；仍在面板的、以及找不到的，都留着并 tries+1。
     连续 3 次才放弃（放弃必须在输出里说出来）——账本少一条 = 那个标签可能永远关不掉。"""
     st = load_state()
+    kept_old = list(st["tabs"])                 # 给 active 找回用（原地改会丢原下标）
     left = {}
     for t in list(remaining) + list(unseen):
         left[t] = left.get(t, 0) + 1
-    keep, dropped = [], []
+    keep_recs, dropped = [], []
     if not inspected:                      # 没进面板/没核对：账本一个字都不动
         return dropped
     for rec in st["tabs"]:
         t = rec.get("title") or ""
+        if any(k in t.lower() for k in (x.lower() for x in keep)):   # --keep 命中的：原样留着，不累加 tries
+            keep_recs.append(rec)
+            continue
         if closed and t in closed:
             closed.remove(t)                       # 同名多条：关掉几条就删几条
             continue
@@ -1123,16 +1222,21 @@ def prune_state(closed, remaining, unseen=(), inspected=True):
             if rec["tries"] >= 3:
                 dropped.append(t)
                 continue
-            keep.append(rec)
+            keep_recs.append(rec)                   # 仍在面板里：保留（原来写成了 keep.append，直接丢账）
         else:
             rec["tries"] = rec.get("tries", 0) + 1
             if rec["tries"] >= 3:
                 dropped.append(rec.get("title") or "")
                 continue
-            keep.append(rec)                        # 面板里找不到 ≠ 关掉了：留着，3 次后才放弃
-    st["tabs"] = keep
-    st["active"] = len(keep) - 1 if keep else None
-    st["last"] = keep[-1]["title"] if keep else None
+            keep_recs.append(rec)                   # 面板里找不到 ≠ 关掉了：留着，3 次后才放弃
+    st["tabs"] = keep_recs
+    # active 尽量保住原指向（按标题找回），找不到才退到末条——无条件改末条会让下一次 rename_active 改错记录
+    act_title = None
+    if isinstance(st.get("active"), int) and 0 <= st["active"] < len(kept_old or []):
+        act_title = (kept_old[st["active"]] or {}).get("title")
+    st["active"] = next((i for i, r in enumerate(keep_recs) if r.get("title") == act_title),
+                        len(keep_recs) - 1 if keep_recs else None)
+    st["last"] = keep_recs[-1]["title"] if keep_recs else None
     save_state(st)
     return dropped
 
@@ -1141,10 +1245,17 @@ def cmd_fast(a):
     """只读的活别动屏幕：内置 WebView 取正文，40ms 拿到，不占用户的手机。"""
     url = _url_of(" ".join(a.target))
     t0 = time.time()
-    p = subprocess.run(["minis-browser-use", "navigate", "--url", url],
-                       capture_output=True, text=True, timeout=60)
+    try:
+        p = subprocess.run(["minis-browser-use", "navigate", "--url", url],
+                           capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        die(f"内置浏览器 60s 没返回", "换外置：bw go <url>", code=2)
     nav = int((time.time() - t0) * 1000)
-    if '"ok": true' not in p.stdout:
+    try:
+        ok_json = json.loads(p.stdout).get("ok") is True
+    except Exception:                                          # noqa: BLE001
+        ok_json = False
+    if not ok_json:
         print(f"✘ 内置浏览器打不开（{p.stdout.strip()[:100]}）——换外置：bw go {url}")
         sys.exit(2)
     r = subprocess.run(["minis-browser-use", "get_readable"], capture_output=True, text=True, timeout=30)
@@ -1179,13 +1290,13 @@ def bring_front(wait=3.0, tries=2):
 def cmd_go(a):
     # 默认不新开标签：能不新开就不新开——"不用关"比"关得准"更可靠。
     # 判据只看一件事：当前页的标题在不在我的记账里。在 → 是我开的，可以复用；不在 → 是用户的，新开。
-    mine = {t for t in session_titles() if t}
+    mine = [t for t in session_titles() if t]
     cur = bar_text(dump())
     if a.new:
         new_tab, why = True, "（--new）"
     elif a.reuse:
         new_tab, why = False, "（--reuse）"
-    elif cur and cur in mine:
+    elif cur and any(_title_match(cur, t) or _title_match(t, cur) for t in mine):
         new_tab, why = False, "（复用我自己开的这一页）"
     else:
         new_tab, why = True, "（当前页不是我的，新开）"
@@ -1518,7 +1629,26 @@ def cmd_tabs(a):
             print(f"✘ 没关掉：“{a.arg}” 不在标签面板里，或 × 点不掉"
                   f"（before={r['before']} after={r['after']}）")
             sys.exit(3)
+        prune_state(list(r["closed"]), r["remaining"], r.get("unseen", ()),
+                    inspected=r["status"] in ("ok", "partial"))
         print(f"✔ 关掉并核实 {len(r['closed'])} 个：" + "；".join(c[:30] for c in dict.fromkeys(r["closed"])))
+        return
+    if a.op == "panel":
+        # 只看不判：把面板里每张卡的标题和"当前页"一起打出来。
+        # 排"我的标签去哪了"这类问题时，光看 剩N/共M 不够（2026-11-23 反复卡在这里）。
+        cur = bar_text(dump())
+        if not open_tabview():
+            die("打不开标签管理", "先 bw go <url> 或手动点开浏览器", code=2)
+        labels, t1 = [], time.time()
+        while time.time() - t1 < 2.5:
+            labels = [label(r) for r in _cards()]
+            if labels:
+                break
+            time.sleep(0.3)
+        a11y("input", "key", "back")
+        print(f"当前页《{cur or '?'}》；面板 {len(labels)} 张卡：")
+        for i, x in enumerate(labels, 1):
+            print(f"  {i}. {x[:40]}")
         return
     if a.op == "verify":
         titles = [t for t in dict.fromkeys(session_titles()) if t]
@@ -1542,8 +1672,14 @@ def cmd_tabs(a):
             print(f"剩 0 个（我没有记录）；面板里现有 {len(labels)} 张卡{extra}，都不是我开的，未动")
             return
         left = [t for t in titles if any(t[:12] in l for l in labels)]
+        miss = [t for t in titles if t not in left]
+        zero_hint = "（一张都没读到：面板可能只剩最后一张标签，它没有 ×，不在卡里）" if not labels else ""
         print(f"剩 {len(left)} 个" + ("：" + "；".join(x[:20] for x in left) if left else "")
-              + f"（面板共 {len(labels)} 张卡）")
+              + f"（面板共 {len(labels)} 张卡，记账 {len(titles)} 条）" + zero_hint)
+        if miss:
+            # 记账里有、面板里找不到：不能说"剩 0 个"就完事——那会让人以为账是干净的
+            print(f"  另有 {len(miss)} 条在面板里找不到（可能已关掉或改了标题）："
+                  + "；".join(x[:20] for x in miss[:4]))
         if left:
             sys.exit(3)
         return
@@ -1581,11 +1717,24 @@ def dismiss_dialog():
     return ""
 
 def cmd_close(a):
+    keeps = list(getattr(a, "keep", None) or [])
     titles = session_titles()
+    if keeps and titles:
+        kl = [k.lower() for k in keeps]
+        held = [t for t in titles if any(k in t.lower() for k in kl)]
+        if held:
+            print("· 依 --keep 留着：" + "；".join(x[:30] for x in dict.fromkeys(held)))
+        titles = [t for t in titles if t not in held]
     if not titles:
         # 没有要关的也要复位拟人，并且说话（原来静默只剩一行耗时，看着像没执行）
         human_set(False)
-        print("✔ 没有我开的标签要关；拟人已复位")
+        if keeps and session_titles():
+            print(f"✔ 依 --keep 保留 {len(set(session_titles()))} 个，没有别的要关；拟人已复位")
+        else:
+            print("✔ 没有我开的标签要关；拟人已复位")
+    if a.keep_tabs and titles:
+        human_set(False)
+        print(f"✔ 只清弹窗/复位拟人，标签不动（--keep-tabs）；记账 {len(set(titles))} 条留着")
     if not a.keep_tabs and titles:
         n0 = len(titles)
         r = close_verified(titles)
@@ -1613,16 +1762,15 @@ def cmd_close(a):
             print("  下一步：手动点一下地址栏旁的标签数，再跑 bw close")
             sys.exit(3)
         dropped = prune_state(list(r["closed"]), r["remaining"], r.get("unseen", ()),
-                              inspected=r["status"] in ("ok", "partial"))
+                              inspected=r["status"] in ("ok", "partial"), keep=keeps)
         if not r["remaining"]:
-            if r["drift"] is not None and r["before"] is not None and r["after"] is not None \
-                    and (r["after"] > r["before"] or abs(r["drift"]) > 1):
-                print(f"✘ 数字对不上（before={r['before']} after={r['after']} closed={len(r['closed'])}），不判成功")
-                sys.exit(3)
+            # 数量一致性已在 close_verified 里判过（status=changed 就退 3），这里别再重复判：
+            # 关的是当前标签时浏览器会补一张空白页，drift 会等于 closed，旧检查会把它误判成"数字对不上"（2026-11-22）。
             if r["closed"]:
                 print(f"✔ 关掉并核实 {len(r['closed'])} 个标签："
                       + "；".join(x[:24] for x in dict.fromkeys(r["closed"])))
-                print(f"  before={r['before']} after={r['after']}（面板里少了 {r['before'] - r['after']} 张）")
+                print(f"  before={r['before']} after={r['after']}（面板里少了 {r['before'] - r['after']} 张）"
+                      + (r.get("note") or ""))
             elif r.get("unseen"):
                 # 面板里数到了卡片，但没有一张对得上我的记账：不知道是用户关了还是改了标题。
                 # 记录**不清**（prune 会 tries+1，3 次才放弃），也别打 ✔。
@@ -1716,6 +1864,8 @@ def main():
     p = sub.add_parser("tabs"); p.add_argument("op", nargs="?")
     p.add_argument("arg", nargs="?"); p.set_defaults(f=cmd_tabs)
     p = sub.add_parser("close"); p.add_argument("--keep-tabs", action="store_true")
+    p.add_argument("--keep", action="append", metavar="片段",
+                   help="标题含这个片段的标签先不关（可写多次）；仍留在记账里")
     p.add_argument("--home", action="store_true", help="关完回桌面（默认不回：本机 Minis 进后台后无法再拉起浏览器）")
     p.set_defaults(f=cmd_close)
     p = sub.add_parser("find"); p.add_argument("query", nargs="+")
@@ -1728,6 +1878,9 @@ def main():
     p = sub.add_parser("shot"); p.set_defaults(f=cmd_shot)
 
     a = ap.parse_args()
+    if not hasattr(a, "f"):
+        ap.print_help()
+        return
     global HUMAN
     if os.environ.get("BW_HUMAN", "").strip() == "0":
         HUMAN = False                       # 硬关：连粘性状态也不认（原来会被 human_until 覆盖）
